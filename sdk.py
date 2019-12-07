@@ -38,13 +38,43 @@ class MongoMapreduceAPI:
         response = self.session.post(url, json=request_payload)
         return response.json()
 
-    def list_jobs(self):
-        url = "/api/v1/{project_id}/jobs".format(project_id=self.project_id)
-        response = self.session.get(url)
-        payload = response.json()
-        return payload["jobs"]
+    def list_jobs(self, completed=None, queue=None, order_by=None, page=None, perPage=None, block=False, timeout=(10,10)):
+        request_payload = {}
+        if completed is not None:
+            request_payload["completed"] = completed
 
-    def initialize(self, job_id, db_name, collection_name):
+        if queue is not None:
+            request_payload["queue"] = queue
+
+        if order_by is not None:
+            request_payload["order_by"] = order_by
+
+        if page is not None:
+            request_payload["page"] = page
+
+        if perPage is not None:
+            request_payload["perPage"] = perPage
+
+        request_payload["block"] = block
+
+        url = "/api/v1/{project_id}/jobs/list".format(project_id=self.project_id)
+        response = self.session.get(url, json=request_payload, timeout=timeout)
+        response_payload = response.json()
+        return response_payload["jobs"]
+
+    def get_next_job(self, queue=None):
+        jobs = self.list_jobs(
+            completed=False,
+            queue=queue,
+            order_by=[("submitted", pymongo.ASCENDING)],
+            page=1,
+            perPage=1,
+            block=True,
+            timeout=(10,1000)
+        )
+        return jobs[0]
+
+    def initialize(self, job, db_name, collection_name):
         namespace = "{0}.{1}".format(db_name, collection_name)
         chunks = []
         for chunk in self.mongo_client.config.chunks.find({"ns":namespace}, sort=[("minKey", pymongo.ASCENDING)]):
@@ -55,32 +85,26 @@ class MongoMapreduceAPI:
             })
         init_payload = {"chunks":chunks}
         init_url = "/api/v1/projects/{project_id}/jobs/{job_id}/initialize".format(
-            project_id = self.project_id, job_id=job_id
+            project_id = self.project_id, job_id=job["_id"]
         )
         requests.post(init_url, json=init_payload)
 
     def run(self, worker_functions, queue=None):
-        work_url = "/api/v1/projects/{project_id}/work".format(
-            project_id = self.project_id
-        )
-        query_params = {}
-        if queue is not None:
-            query_params["queue"] = queue
         while True:
+            job = self.get_next_job()
+            db_name = job["database"]
+            collection_name = job["collection"]
+            if not job.get("initialized"):
+                self.initialize(job, db_name, collection_name)
+            work_url = "/api/v1/projects/{project_id}/jobs/{job_id}/work".format(
+                project_id=self.project_id, job_id=job["_id"]
+            )
+
             try:
-                work_response = self.session.get(
-                    work_url,
-                    params=query_params,
-                    timeout = (10, 1000)
-                )
+                work_response = self.session.get(work_url)
             except requests.exceptions.ReadTimeout:
                 continue
             work_payload = work_response.json()
-            job = work_payload["job"]
-            db_name = work_payload["database"]
-            collection_name = work_payload["collection"]
-            if not job.get("initialized"):
-                self.initialize(job["_id"], db_name, collection_name)
             function_name = work_payload["functionName"]
             do_work = worker_functions[function_name]
             query = work_payload["query"]

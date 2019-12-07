@@ -74,16 +74,34 @@ class MongoMapreduceAPI:
         )
         return jobs[0]
 
-    def initialize(self, job, db_name, collection_name):
+    def initialize(self, job, db_name, collection_name, query):
         namespace = "{0}.{1}".format(db_name, collection_name)
         chunks = []
-        for chunk in self.mongo_client.config.chunks.find({"ns":namespace}, sort=[("minKey", pymongo.ASCENDING)]):
+        for chunk in self.mongo_client.config.chunks.find({"ns":namespace}):
             chunks.append({
                 "min": chunk["min"],
                 "max": chunk["max"],
                 "shard": chunk["shard"]
             })
-        init_payload = {"chunks":chunks}
+        min = list(self.mongo_client[db_name][collection_name].find(
+            query, projection=["_id"]
+        ).sort(
+            [("_id", pymongo.ASCENDING)]
+        ).limit(1))
+        if min == []:
+            minId = None
+        else:
+            minId = min[0]["_id"]
+        max = list(self.mongo_client[db_name][collection_name].find(
+            query, projection=["_id"]
+        ).sort(
+            [("_id", pymongo.DESCENDING)]
+        ).limit(1))
+        if max == []:
+            maxId = None
+        else:
+            maxId = max[0]["_id"]
+        init_payload = {"chunks":chunks, "minId": minId, "maxId":maxId}
         init_url = "/api/v1/projects/{project_id}/jobs/{job_id}/initialize".format(
             project_id = self.project_id, job_id=job["_id"]
         )

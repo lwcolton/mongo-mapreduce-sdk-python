@@ -74,7 +74,7 @@ class MongoMapreduceAPI:
         )
         return jobs[0]
 
-    def initialize(self, job, db_name, collection_name, query):
+    def initialize(self, job, db_name, collection_name):
         namespace = "{0}.{1}".format(db_name, collection_name)
         chunks = []
         for chunk in self.mongo_client.config.chunks.find({"ns":namespace}):
@@ -84,7 +84,7 @@ class MongoMapreduceAPI:
                 "shard": chunk["shard"]
             })
         min = list(self.mongo_client[db_name][collection_name].find(
-            query, projection=["_id"]
+            projection=["_id"]
         ).sort(
             [("_id", pymongo.ASCENDING)]
         ).limit(1))
@@ -93,7 +93,7 @@ class MongoMapreduceAPI:
         else:
             minId = min[0]["_id"]
         max = list(self.mongo_client[db_name][collection_name].find(
-            query, projection=["_id"]
+            projection=["_id"]
         ).sort(
             [("_id", pymongo.DESCENDING)]
         ).limit(1))

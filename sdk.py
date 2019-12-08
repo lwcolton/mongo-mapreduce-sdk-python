@@ -1,7 +1,11 @@
+import collections
+import math
+import time
+
+import bson
 import pymongo
 import requests
 import requests.exceptions
-from bson.objectid import ObjectId
 
 
 class MongoMapreduceAPI:
@@ -75,47 +79,62 @@ class MongoMapreduceAPI:
         return jobs[0]
 
     def initialize(self, job, db_name, collection_name):
-        namespace = "{0}.{1}".format(db_name, collection_name)
-        chunks = []
-        for chunk in self.mongo_client.config.chunks.find({"ns":namespace}):
-            chunks.append({
-                "min": chunk["min"],
-                "max": chunk["max"],
-                "shard": chunk["shard"]
-            })
-        min = list(self.mongo_client[db_name][collection_name].find(
-            projection=["_id"]
-        ).sort(
-            [("_id", pymongo.ASCENDING)]
-        ).limit(1))
-        if min == []:
-            minId = None
+        init_payload = {}
+        collection_namespace = "{0}.{1}".format(db_name, collection_name)
+        collections_bson = list(self.mongo_client.config.collections.find_raw_bson({"_id":collection_namespace}))
+        if collections_bson:
+            codec_options = bson.CodecOptions(document_class=collections.OrderedDict)
+            collection_info = bson.BSON.decode(collections_bson[0], codec_options=codec_options)
+            key = collection_info["key"]
+            sort_keys = list(key.keys())
+            sort = [(sort_key, key[sort_key]) for sort_key in sort_keys]
         else:
-            minId = min[0]["_id"]
-        max = list(self.mongo_client[db_name][collection_name].find(
-            projection=["_id"]
-        ).sort(
-            [("_id", pymongo.DESCENDING)]
-        ).limit(1))
-        if max == []:
-            maxId = None
+            sort_keys = ["_id"]
+            sort = [("_id"), 1]
+        major_version, minor_version, patch_version = pymongo.version_tuple
+        if (major_version == 3 and minor_version >= 7) or major_version > 3:
+            count = self.mongo_client[db_name][collection_name].estimated_document_count()
         else:
-            maxId = max[0]["_id"]
-        init_payload = {"chunks":chunks, "minId": minId, "maxId":maxId}
+            count = self.mongo_client[db_name][collection_name].count()
+
+        if count >= 10000:
+            chunks = 1000
+        else:
+            chunks = 10
+        skip = math.ceil(count / chunks)
         init_url = "/api/v1/projects/{project_id}/jobs/{job_id}/initialize".format(
             project_id = self.project_id, job_id=job["_id"]
         )
-        requests.post(init_url, json=init_payload)
+        init_response = requests.post(init_url)
+        
+        range_docs = []
+        initialize_timeout = job["initializeTimeout"]
+        start_time = int(time.time())
+        update_time = start_time + (initialize_timeout / 2)
+        for x in range(0,chunks):
+            return_docs = list(self.mongo_client[db_name][collection_name].find().sort(sort).skip(skip*x).limit(1))
+            if return_docs:
+                range_doc = {key: return_docs[0][key] for key in sort_keys}
+                if range_docs[-1] != range_doc:
+                    range_docs.append(range_doc)
+            else:
+                break
+            if int(time.time()) >= update_time:
+                requests.patch(init_url)
 
-    def run(self, worker_functions, queue=None):
+        init_payload["rangeDocs"] = range_docs
+
+
+    def run(self, worker_functions, queue=None, documents_per_call=100):
+        worker_id = str(bson.ObjectId())
         while True:
             job = self.get_next_job()
             db_name = job["database"]
             collection_name = job["collection"]
             if not job.get("initialized"):
                 self.initialize(job, db_name, collection_name)
-            work_url = "/api/v1/projects/{project_id}/jobs/{job_id}/work".format(
-                project_id=self.project_id, job_id=job["_id"]
+            work_url = "/api/v1/projects/{project_id}/jobs/{job_id}/work/{worker_id}".format(
+                project_id=self.project_id, job_id=job["_id"], worker_id=worker_id
             )
 
             try:
@@ -128,10 +147,9 @@ class MongoMapreduceAPI:
             query = work_payload["query"]
             work_params = work_payload["params"]
             sort = work_payload["sort"]
-            limit = work_payload.get("limit")
             mongo_query = self.mongo_client[collection_name].find(query, sort=sort)
-            if limit:
-                mongo_query = mongo_query.limit(limit)
+            if documents_per_call:
+                mongo_query = mongo_query.limit(documents_per_call)
             documents = list(mongo_query)
             do_work(documents, params=work_params)
             self.session.post(

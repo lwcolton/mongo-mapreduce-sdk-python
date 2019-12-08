@@ -61,7 +61,7 @@ class MongoMapreduceAPI:
 
         request_payload["block"] = block
 
-        url = "/api/v1/{project_id}/jobs/list".format(project_id=self.project_id)
+        url = "/api/v1/{project_id}/list_jobs".format(project_id=self.project_id)
         response = self.session.get(url, json=request_payload, timeout=timeout)
         response_payload = response.json()
         return response_payload["jobs"]
@@ -70,7 +70,7 @@ class MongoMapreduceAPI:
         jobs = self.list_jobs(
             completed=False,
             queue=queue,
-            order_by=[("submitted", pymongo.ASCENDING)],
+            order_by=[("submittedAtEpoch", pymongo.ASCENDING)],
             page=1,
             perPage=1,
             block=True,
@@ -78,7 +78,26 @@ class MongoMapreduceAPI:
         )
         return jobs[0]
 
-    def initialize(self, job, db_name, collection_name):
+    def get_job(self, job_id):
+        url = "/api/v1/{project_id}/jobs/{job_id}".format(project_id=self.project_id, job_id=job_id)
+        response = self.session.get(url)
+        return response.json()
+
+
+    def initialize(self, job, db_name, collection_name, worker_id):
+        init_url = "/api/v1/projects/{project_id}/jobs/{job_id}/initialize".format(
+            project_id = self.project_id, job_id=job["_id"]
+        )
+        while True:
+            init_post_response = self.session.post(init_url)
+            init_post_response_body = init_post_response.json()
+            initialized = init_post_response_body["initialized"]
+            if initialized:
+                return
+            elif init_post_response_body["workerId"] == worker_id:
+                break
+            time.sleep(5)
+
         init_payload = {}
         collection_namespace = "{0}.{1}".format(db_name, collection_name)
         collections_bson = list(self.mongo_client.config.collections.find_raw_bson({"_id":collection_namespace}))
@@ -102,11 +121,7 @@ class MongoMapreduceAPI:
         else:
             chunks = 10
         skip = math.ceil(count / chunks)
-        init_url = "/api/v1/projects/{project_id}/jobs/{job_id}/initialize".format(
-            project_id = self.project_id, job_id=job["_id"]
-        )
-        init_response = requests.post(init_url)
-        
+
         range_docs = []
         initialize_timeout = job["initializeTimeout"]
         start_time = int(time.time())
@@ -120,19 +135,19 @@ class MongoMapreduceAPI:
             else:
                 break
             if int(time.time()) >= update_time:
-                requests.patch(init_url)
+                self.session.patch(init_url)
 
         init_payload["rangeDocs"] = range_docs
-
+        self.session.put(init_url, json=init_payload)
 
     def run(self, worker_functions, queue=None, documents_per_call=100):
         worker_id = str(bson.ObjectId())
         while True:
-            job = self.get_next_job()
+            job = self.get_next_job(queue=queue)
             db_name = job["database"]
             collection_name = job["collection"]
             if not job.get("initialized"):
-                self.initialize(job, db_name, collection_name)
+                self.initialize(job, db_name, collection_name, worker_id)
             work_url = "/api/v1/projects/{project_id}/jobs/{job_id}/work/{worker_id}".format(
                 project_id=self.project_id, job_id=job["_id"], worker_id=worker_id
             )
@@ -148,10 +163,8 @@ class MongoMapreduceAPI:
             work_params = work_payload["params"]
             sort = work_payload["sort"]
             mongo_query = self.mongo_client[collection_name].find(query, sort=sort)
-            if documents_per_call:
-                mongo_query = mongo_query.limit(documents_per_call)
-            documents = list(mongo_query)
-            do_work(documents, params=work_params)
+            for document in mongo_query:
+                do_work(document, params=work_params)
             self.session.post(
                 work_url,
                 json={"_id": work_payload["_id"]}

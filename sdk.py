@@ -1,4 +1,5 @@
 import collections
+import copy
 import math
 import time
 
@@ -76,7 +77,10 @@ class MongoMapreduceAPI:
             block=True,
             timeout=(10,1000)
         )
-        return jobs[0]
+        if jobs:
+            return jobs[0]
+        else:
+            return None
 
     def get_job(self, job_id):
         url = "/api/v1/{project_id}/jobs/{job_id}".format(project_id=self.project_id, job_id=job_id)
@@ -101,12 +105,17 @@ class MongoMapreduceAPI:
         init_payload = {}
         collection_namespace = "{0}.{1}".format(db_name, collection_name)
         collections_bson = list(self.mongo_client.config.collections.find_raw_bson({"_id":collection_namespace}))
+        init_query = None
         if collections_bson:
             codec_options = bson.CodecOptions(document_class=collections.OrderedDict)
             collection_info = bson.BSON.decode(collections_bson[0], codec_options=codec_options)
             key = collection_info["key"]
             sort_keys = list(key.keys())
             sort = [(sort_key, key[sort_key]) for sort_key in sort_keys]
+            if sort_keys[0] in job["query"]:
+                init_query = job["query"]
+
+
         else:
             sort_keys = ["_id"]
             sort = [("_id"), 1]
@@ -119,15 +128,16 @@ class MongoMapreduceAPI:
         if count >= 10000:
             chunks = 1000
         else:
-            chunks = 10
+            chunks = 100
         skip = math.ceil(count / chunks)
 
         range_docs = []
         initialize_timeout = job["initializeTimeout"]
         start_time = int(time.time())
         update_time = start_time + (initialize_timeout / 2)
+        collection = self.mongo_client[db_name][collection_name]
         for x in range(0,chunks):
-            return_docs = list(self.mongo_client[db_name][collection_name].find().sort(sort).skip(skip*x).limit(1))
+            return_docs = list(collection.find(filter=init_query).sort(sort).skip(skip*x).limit(1))
             if return_docs:
                 range_doc = {key: return_docs[0][key] for key in sort_keys}
                 if range_docs[-1] != range_doc:
@@ -140,7 +150,7 @@ class MongoMapreduceAPI:
         init_payload["rangeDocs"] = range_docs
         self.session.put(init_url, json=init_payload)
 
-    def run(self, worker_functions, queue=None, documents_per_call=100):
+    def run(self, worker_functions, queue=None, documents_per_call=20):
         worker_id = str(bson.ObjectId())
         while True:
             job = self.get_next_job(queue=queue)
@@ -163,18 +173,23 @@ class MongoMapreduceAPI:
             work_params = work_payload["params"]
             sort = work_payload["sort"]
             mongo_query = self.mongo_client[collection_name].find(query, sort=sort)
-            for document in mongo_query:
-                do_work(document, params=work_params)
+            more_work = True
+            while more_work:
+                range_id = str(bson.ObjectId())
+                documents = []
+                for x in range(0, documents_per_call):
+                    try:
+                        documents.append(next(mongo_query))
+                    except StopIteration:
+                        more_work = False
+                if documents:
+                    results = do_work(documents, params=work_params)
+                    if job["outputCollection"] and results:
+                        results = copy.deepcopy(results)
+                        for result in results:
+                            result["rangeId"] = range_id
+                        self.mongo_client[db_name][job["outputCollection"]].insert_many(results)
             self.session.post(
                 work_url,
-                json={"_id": work_payload["_id"]}
+                json={"rangeProcessed": {"index": work_payload["index"]}}
             )
-
-
-
-select master
-master gets shard config or document count and calls API
-API:
-if sharded use shard config chunks
-if not sharded docs_per_chunk = count_documents / (num_workers * 10), sort by _id ascending
-api tells sdk query, sort, skip, and limit

@@ -28,31 +28,34 @@ class MongoMapreduceAPI:
         session.headers.update({'x-api-key': api_key})
         return session
 
-    def submit_job(self, function_name=None, queue=None, query=None):
+    def submit_job(self, function_name, queue=None, query=None, outputCollection=None, outputIndexes=None):
         if type(function_name != str):
             raise ValueError("Must supply function_name type str")
         if query is None:
             query = {}
         url = "/api/v1/{project_id}/jobs".format(project_id=self.project_id)
         request_payload = {
-            "functionName": function_name,
-            "query": query
+            "functionName": function_name
         }
+
         if queue:
             request_payload["queue"] = queue
+        if query:
+            request_payload["query"] = query
+        if outputCollection:
+            request_payload["outputCollection"] = outputCollection
+        if outputIndexes:
+            request_payload["outputIndexes"] = outputIndexes
         response = self.session.post(url, json=request_payload)
         return response.json()
 
-    def list_jobs(self, completed=None, queue=None, order_by=None, page=None, perPage=None, block=False, timeout=(10,10)):
+    def list_jobs(self, filter=None, sort=None, page=None, perPage=None, block=False, timeout=(10,10)):
         request_payload = {}
-        if completed is not None:
-            request_payload["completed"] = completed
+        if filter is not None:
+            request_payload["filter"] = filter
 
-        if queue is not None:
-            request_payload["queue"] = queue
-
-        if order_by is not None:
-            request_payload["order_by"] = order_by
+        if sort is not None:
+            request_payload["sort"] = sort
 
         if page is not None:
             request_payload["page"] = page
@@ -60,22 +63,22 @@ class MongoMapreduceAPI:
         if perPage is not None:
             request_payload["perPage"] = perPage
 
-        request_payload["block"] = block
-
-        url = "/api/v1/{project_id}/list_jobs".format(project_id=self.project_id)
+        url = "/api/v1/{project_id}/jobs_search".format(project_id=self.project_id)
         response = self.session.get(url, json=request_payload, timeout=timeout)
         response_payload = response.json()
         return response_payload["jobs"]
 
     def get_next_job(self, queue=None):
+        filter = {
+            "completed": False
+        }
+        if queue is not None:
+            filter["queue"] = queue
         jobs = self.list_jobs(
-            completed=False,
-            queue=queue,
-            order_by=[("submittedAtEpoch", pymongo.ASCENDING)],
+            filter=filter,
+            sort=[("submittedAtEpoch", pymongo.ASCENDING)],
             page=1,
             perPage=1,
-            block=True,
-            timeout=(10,1000)
         )
         if jobs:
             return jobs[0]
@@ -113,9 +116,10 @@ class MongoMapreduceAPI:
             sort_keys = list(key.keys())
             sort = [(sort_key, key[sort_key]) for sort_key in sort_keys]
             if sort_keys[0] in job["query"]:
-                init_query = job["query"]
-
-
+                init_query = {}
+                for index_key in sort_keys:
+                    if index_key in job["query"]:
+                        init_query[index_key] = job["query"][index_key]
         else:
             sort_keys = ["_id"]
             sort = [("_id"), 1]
@@ -147,13 +151,16 @@ class MongoMapreduceAPI:
             if int(time.time()) >= update_time:
                 self.session.patch(init_url)
 
-        init_payload["rangeDocs"] = range_docs
+        init_payload["ranges"] = range_docs
         self.session.put(init_url, json=init_payload)
 
     def run(self, worker_functions, queue=None, documents_per_call=20):
         worker_id = str(bson.ObjectId())
         while True:
             job = self.get_next_job(queue=queue)
+            while job is None:
+                time.sleep(10)
+                job = self.get_next_job(queue=queue)
             db_name = job["database"]
             collection_name = job["collection"]
             if not job.get("initialized"):

@@ -34,32 +34,37 @@ class MongoMapreduceAPI:
         response.raise_for_status()
         return response.json()
 
-    def submit_job(self, projectId=None,  functionName=None, database=None, collection=None, queue=None, query=None, outputCollection=None, outputIndexes=None):
+    def submit_job(self, projectId=None,  mapFunctionName=None, reduceFunctionName=None, finalizeFunctionName=None,
+                   inputDatabase=None, inputCollection=None, queue=None, filter=None, outputCollection=None,
+                   outputDatabase=None):
         if type(projectId) != str or not projectId:
             raise ValueError("Must supply projectId argument, type string")
-        if type(functionName) != str or not functionName:
+        if type(mapFunctionName) != str or not mapFunctionName:
             raise ValueError("Must supply functionName argument, type string")
-        if type(database) != str or not database:
-            raise ValueError("Must supply database argument, type string")
-        if type(collection) != str or not collection:
+        if type(inputDatabase) != str or not inputDatabase:
+            raise ValueError("Must supply inputDatabase argument, type string")
+        if type(inputCollection) != str or not inputCollection:
             raise ValueError("Must supply collection argument, type string")
-        if query is None:
-            query = {}
         url = self.get_url("/api/v1/projects/{projectId}/jobs".format(projectId=projectId))
         request_payload = {
-            "database": database,
-            "collection": collection,
-            "functionName": functionName
+            "inputDatabase": inputDatabase,
+            "inputCollection": inputCollection,
+            "mapFunctionName": mapFunctionName
         }
 
         if queue:
             request_payload["queue"] = queue
-        if query:
-            request_payload["query"] = query
+        if filter:
+            request_payload["filter"] = filter
         if outputCollection:
+            if not outputDatabase:
+                raise ValueError("If setting outputCollection, must also set outputDatabase")
+            request_payload["outputDatabase"] = outputDatabase
             request_payload["outputCollection"] = outputCollection
-        if outputIndexes:
-            request_payload["outputIndexes"] = outputIndexes
+        if reduceFunctionName:
+            request_payload["reduceFunctionName"] = reduceFunctionName
+        if finalizeFunctionName:
+            request_payload["finalizeFunctionName"] = finalizeFunctionName
         response = self.session.post(url, json=request_payload)
         response.raise_for_status()
         return response.json()

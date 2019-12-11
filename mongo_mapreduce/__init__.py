@@ -131,8 +131,7 @@ class MongoMapreduceAPI:
 
         range_docs = []
         initialize_timeout = job["initializeTimeout"]
-        start_time = int(time.time())
-        update_time = start_time + (initialize_timeout / 2)
+        update_time = int(time.time()) + (initialize_timeout / 2)
         collection = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]]
         for x in range(0,chunks):
             return_docs = list(collection.find(filter=init_query).sort(sort).skip(skip*x).limit(1))
@@ -144,14 +143,14 @@ class MongoMapreduceAPI:
                 break
             if int(time.time()) >= update_time:
                 self.session.patch(init_url)
-
+                update_time = int(time.time()) + (initialize_timeout / 2)
         init_put_payload = {
             "ranges": range_docs
         }
         self.session.put(init_url, json=init_put_payload)
 
-    def run(self, projectId, worker_functions, queue=None, documents_per_call=100):
-        worker_id = str(bson.ObjectId())
+    def run(self, projectId, worker_functions, queue=None, batch_size=100):
+        workerId = str(bson.ObjectId())
         while True:
             work_url = "/api/v1/projects/{projectId}/work".format(
                 projectId=projectId
@@ -166,58 +165,106 @@ class MongoMapreduceAPI:
             work_get_payload = work_get_response.json()
             job = work_get_payload["job"]
             if work_get_payload["action"] == "initialize":
-                self.initialize(projectId, job, worker_id)
+                self.initialize(projectId, job, workerId)
                 continue
-
-
-
-
-
-            work_params = job["params"]
-            sort = work_payload["sort"]
-            range_id = str(bson.ObjectId())
-            mapFunction = worker_functions[job["mapFunctionName"]]
-            reduceFunction = worker_functions.get(job["reduceFunctionName"])
-            if work_payload["stage"] == "map":
-                mongo_query = self.mongo_client[job["inputDatabase"]][job["inputCollection"]].find(
-                    work_payload["query"], sort=sort
+            stage_url = self.get_url(
+                "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges/{rangeIndex}".format(
+                    projectId=projectId,
+                    jobId=job["_id"],
+                    stageIndex=job["currentStageIndex"],
+                    rangeIndex=work_get_payload["rangeIndex"]
                 )
-            elif work_payload["stage"] == "reduce":
-                mongo_query = self.mongo_client[job["tempDatabase"]][job["tempCollection"]].find(
-                    sort=("key", 1)
-                )
-            else:
-
-            more_work = True
-            while more_work:
-
-                documents = []
-                for x in range(0, documents_per_call):
-                    try:
-                        documents.append(next(mongo_query))
-                    except StopIteration:
-                        more_work = False
-                if documents:
-                    results = do_work(documents, params=work_params)
-                    if results and job["outputCollection"]:
-                        reduce_function = worker_functions[job["reduceFunction"]]
-                        if work_payload["stage"] == "map":
-                            output_docs = {}
-                            for key, value in results:
-                                output_docs.setdefault(key, [])
-                                output_docs[key].append(value)
-                            output_keys = list(output_docs.keys())
-                            for key in output_keys:
-                                values = output_docs[key]
-                                if len(values) > 1:
-                                    result = reduce_function(values)
-                                    output_docs[key] = [result]
-                            insert_docs = []
-                            for key in output_keys:
-                                values = output_docs[key]
-                                insert_docs.append({"key":key, values: values, "rangeId": range_id})
-                            self.mongo_client[job["tempDatabase"]][job["tempCollection"]].insert_many(insert_docs)
-            self.session.post(
-                work_url,
-                json={"rangeProcessed": {"index": work_payload["index"]}}
             )
+            work_timeout = job["workTimeout"]
+            previousInitializingAtEpoch = job["stages"][job["currentStageIndex"]]["initializingAtEpoch"]
+            update_time = previousInitializingAtEpoch + (work_timeout / 2)
+            post_response = self.session.post(stage_url, json={"workerId": workerId})
+            if post_response.status_code == 204:
+                continue
+            stage = job["stages"][job["currentStageIndex"]]
+            filter = {}
+            sort = []
+            if work_get_payload["action"] == "map":
+                filter = job.get("filter", {})
+                sort = job.get("sort", [])
+            elif work_get_payload["action"] == "reduce":
+                sort = [("key", pymongo.ASCENDING)]
+
+            rangeStart = work_get_payload.get("rangeStart")
+            rangeEnd = work_get_payload["rangeEnd"]
+            filter["$and"].setdefault([])
+            for range_key in rangeEnd.keys():
+                if rangeStart:
+                    filter["$and"].append({range_key:{"$gte":rangeStart[range_key]}})
+                filter["$and"].append({range_key:{"$lt":rangeEnd[range_key]}})
+            cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+                filter,
+                batch_size=batch_size
+            ).sort(sort)
+            do_work_function = worker_functions[stage["functionName"]]
+            continue_working = True
+            reduce_key = None
+            reduce_values = []
+            while continue_working:
+                if int(time.time()) > update_time:
+                    patch_response = self.session.post(
+                        stage_url,
+                        json={"workerId": workerId})
+                    if patch_response.status_code == 204:
+                        break
+                    patch_response_body = patch_response.json()
+                    job = patch_response_body["job"]
+                    stage = job["stages"][job["currentStageIndex"]]
+                    previousInitializingAtEpoch = stage["initializingAtEpoch"]
+                    update_time = previousInitializingAtEpoch + (work_timeout / 2)
+                documents = []
+                insert_docs = []
+                for x in range(0, batch_size):
+                    try:
+                        documents.append(cursor.next())
+                    except StopIteration:
+                        continue_working = False
+                        break
+                if work_get_payload["action"] == "map":
+                    output_docs = {}
+                    results = do_work_function(documents)
+                    for key, value in results:
+                        output_docs.setdefault(key, [])
+                        output_docs[key].append(value)
+                    output_keys = list(output_docs.keys())
+                    for key in output_keys:
+                        values = output_docs[key]
+                        if len(values) > 1:
+                            result = do_work_function(values)
+                            output_docs[key] = [result]
+                    for key in output_keys:
+                        values = output_docs[key]
+                        insert_docs.append({"key": key, values: values})
+                elif work_get_payload["action"] == "reduce":
+                    for doc in documents:
+                        if doc["key"] != reduce_key:
+                            reduced_value = do_work_function(reduce_key, reduce_values)
+                            insert_docs.append({"_id": reduce_key, "value": reduced_value})
+                            reduce_values = [doc["value"]]
+                            reduce_key = doc["key"]
+                        else:
+                            reduce_values.append(doc["value"])
+                    if len(reduce_values) > 1:
+                        reduce_values = [do_work_function(reduce_values)]
+                elif work_get_payload["action"] == "finalize":
+                    for doc in documents:
+                        finalized_value = do_work_function(doc["_id"], doc["value"])
+                        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].find_one_and_update(
+                            {
+                                "_id":doc["_id"],
+                                "finalized":{"$exists":False}
+                            },
+                            {
+                                "$set":{
+                                    "value": finalized_value,
+                                    "finalized": True
+                                }
+                            }
+                        )
+                if insert_docs:
+                    self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_many(insert_docs)

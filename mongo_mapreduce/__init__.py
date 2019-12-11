@@ -67,7 +67,7 @@ class MongoMapreduceAPI:
             request_payload["finalizeFunctionName"] = finalizeFunctionName
         response = self.session.post(url, json=request_payload)
         response.raise_for_status()
-        return response.json()
+        return response.json()["job"]
 
     def list_jobs(self, projectId=None, filter=None, sort=None, page=None, perPage=None, timeout=(10,10)):
         if type(projectId) != str or not projectId:
@@ -92,24 +92,33 @@ class MongoMapreduceAPI:
         return response_payload["jobs"]
 
     def get_job(self, projectId, jobId):
-        url = "/api/v1/{projectId}/jobs/{jobId}".format(projectId=projectId, jobId=jobId)
+        url = self.get_url(
+            "/api/v1/projects/{projectId}/jobs/{jobId}".format(
+                projectId=projectId, jobId=jobId
+            )
+        )
         response = self.session.get(url)
-        return response.json()
+        response.raise_for_status()
+        return response.json()["job"]
 
     def initialize(self, projectId, job, worker_id):
         stageIndex = job["currentStageIndex"]
-        init_url = "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/initialize".format(
-            projectId = projectId, jobId=job["_id"], stageIndex=stageIndex
+        init_url = self.get_url(
+            "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/initialize".format(
+                projectId = projectId, jobId=job["_id"], stageIndex=stageIndex
+            )
         )
         init_post_response = self.session.post(init_url, json={"workerId":worker_id})
         if init_post_response.status_code == 204:
             return
+        init_post_response.raise_for_status()
         init_post_response_body = init_post_response.json()
+
         stage = init_post_response_body["job"]["stages"][stageIndex]
         collection_namespace = "{0}.{1}".format(stage["inputDatabase"], stage["inputCollection"])
-        collections_bson = list(self.mongo_client.config.collections.find_raw_bson({"_id":collection_namespace}))
+        collections_bson = list(self.mongo_client.config.collections.find_raw_batches({"_id":collection_namespace}))
         init_query = None
-        if collections_bson:
+        if collections_bson[0]:
             codec_options = bson.CodecOptions(document_class=collections.OrderedDict)
             collection_info = bson.BSON.decode(collections_bson[0], codec_options=codec_options)
             key = collection_info["key"]
@@ -122,7 +131,7 @@ class MongoMapreduceAPI:
                         init_query[index_key] = job["query"][index_key]
         else:
             sort_keys = ["_id"]
-            sort = [("_id"), 1]
+            sort = [("_id", 1)]
         major_version, minor_version, patch_version = pymongo.version_tuple
         if (major_version == 3 and minor_version >= 7) or major_version > 3:
             count = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].estimated_document_count()
@@ -140,6 +149,7 @@ class MongoMapreduceAPI:
         update_time = int(time.time()) + (initialize_timeout / 2)
         collection = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]]
         for x in range(0,chunks):
+            print(sort)
             return_docs = list(collection.find(filter=init_query).sort(sort).skip(skip*x).limit(1))
             if return_docs:
                 range_doc = {key: return_docs[0][key] for key in sort_keys}
@@ -169,16 +179,20 @@ class MongoMapreduceAPI:
     def run(self, projectId, worker_functions, queue=None, batch_size=100):
         workerId = str(bson.ObjectId())
         while True:
-            work_url = "/api/v1/projects/{projectId}/work".format(
-                projectId=projectId
+            work_url = self.get_url(
+                "/api/v1/projects/{projectId}/work".format(
+                    projectId=projectId
+                )
             )
             params = {}
             if queue:
                 params[queue] = queue
             work_get_response = self.session.get(work_url, params=params)
+            work_get_response.raise_for_status()
             while work_get_response.status_code == 204:
                 time.sleep(10)
                 work_get_response = self.session.get(work_url, params=params)
+                work_get_response.raise_for_status()
             work_get_payload = work_get_response.json()
             job = work_get_payload["job"]
             if work_get_payload["action"] == "initialize":

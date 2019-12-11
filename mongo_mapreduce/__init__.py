@@ -4,6 +4,7 @@ import time
 
 import bson
 import pymongo
+import pymongo.errors
 import requests
 import requests.exceptions
 
@@ -149,6 +150,17 @@ class MongoMapreduceAPI:
         }
         self.session.put(init_url, json=init_put_payload)
 
+    def cleanup(self, projectId, job):
+        map_stage = job["stages"][0]
+        self.mongo_client[map_stage["outputDatabase"]][job["tempCollectionName"]].drop()
+        cleanup_url = self.get_url(
+            "/api/v1/projects/{projectId}/jobs/{jobId}/cleanup".format(
+                projectId=projectId, jobId=job["_id"]
+            )
+        )
+        self.session.post(cleanup_url)
+
+
     def run(self, projectId, worker_functions, queue=None, batch_size=100):
         workerId = str(bson.ObjectId())
         while True:
@@ -167,7 +179,10 @@ class MongoMapreduceAPI:
             if work_get_payload["action"] == "initialize":
                 self.initialize(projectId, job, workerId)
                 continue
-            stage_url = self.get_url(
+            elif work_get_payload["action"] == "cleanup":
+                self.cleanup(projectId, job)
+                continue
+            range_url = self.get_url(
                 "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges/{rangeIndex}".format(
                     projectId=projectId,
                     jobId=job["_id"],
@@ -178,7 +193,7 @@ class MongoMapreduceAPI:
             work_timeout = job["workTimeout"]
             previousInitializingAtEpoch = job["stages"][job["currentStageIndex"]]["initializingAtEpoch"]
             update_time = previousInitializingAtEpoch + (work_timeout / 2)
-            post_response = self.session.post(stage_url, json={"workerId": workerId})
+            post_response = self.session.post(range_url, json={"workerId": workerId})
             if post_response.status_code == 204:
                 continue
             stage = job["stages"][job["currentStageIndex"]]
@@ -188,6 +203,13 @@ class MongoMapreduceAPI:
                 filter = job.get("filter", {})
                 sort = job.get("sort", [])
             elif work_get_payload["action"] == "reduce":
+                map_ranges_url = "/api/v1/projects/{projectId}/jobs/{jobId}/stages/0/ranges".format(
+                    projectId=projectId, jobId=job["_id"]
+                )
+                map_ranges_response = self.session.get(map_ranges_url)
+                map_ranges_payload = map_ranges_response.json()
+                valid_result_ids = [map_range["resultId"] for map_range in map_ranges_payload["ranges"]]
+                filter = {"resultId":{"$in":valid_result_ids}}
                 sort = [("key", pymongo.ASCENDING)]
 
             rangeStart = work_get_payload.get("rangeStart")
@@ -205,10 +227,11 @@ class MongoMapreduceAPI:
             continue_working = True
             reduce_key = None
             reduce_values = []
+            resultId = str(bson.ObjectId)
             while continue_working:
                 if int(time.time()) > update_time:
-                    patch_response = self.session.post(
-                        stage_url,
+                    patch_response = self.session.patch(
+                        range_url,
                         json={"workerId": workerId})
                     if patch_response.status_code == 204:
                         break
@@ -232,11 +255,6 @@ class MongoMapreduceAPI:
                         output_docs.setdefault(key, [])
                         output_docs[key].append(value)
                     output_keys = list(output_docs.keys())
-                    for key in output_keys:
-                        values = output_docs[key]
-                        if len(values) > 1:
-                            result = do_work_function(values)
-                            output_docs[key] = [result]
                     for key in output_keys:
                         values = output_docs[key]
                         insert_docs.append({"key": key, values: values})
@@ -267,4 +285,10 @@ class MongoMapreduceAPI:
                             }
                         )
                 if insert_docs:
-                    self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_many(insert_docs)
+                    for doc in insert_docs:
+                        doc["resultId"] = resultId
+                    try:
+                        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_many(insert_docs)
+                    except pymongo.errors.DuplicateKeyError as duplicate_key_error:
+                        pass
+            put_response = self.session.put(range_url, json={"resultId": resultId})

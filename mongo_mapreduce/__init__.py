@@ -275,8 +275,6 @@ class MongoMapreduceAPI:
             rangeEnd = work_get_payload["rangeEnd"]
             filter.setdefault("$and", [])
             objectIdKeys = work_get_payload.get("objectIdKeys", [])
-            print(rangeStart)
-            print(rangeEnd)
             for range_key in rangeStart.keys():
                 startValue = rangeStart[range_key]
                 if range_key in objectIdKeys:
@@ -301,14 +299,10 @@ class MongoMapreduceAPI:
                 if not self.continue_working:
                     return
                 if int(time.time()) > update_time:
+                    update_time = int(time.time()) + (work_timeout / 2)
                     patch_response = self.api_call("patch", range_url, json={"workerId": workerId})
                     if patch_response.status_code == 204:
                         break
-                    patch_response_body = patch_response.json()
-                    job = patch_response_body["job"]
-                    stage = job["stages"][job["currentStageIndex"]]
-                    previousInitializingAtEpoch = stage["initializingAtEpoch"]
-                    update_time = previousInitializingAtEpoch + (work_timeout / 2)
                 documents = []
                 insert_docs = []
                 for x in range(0, batch_size):

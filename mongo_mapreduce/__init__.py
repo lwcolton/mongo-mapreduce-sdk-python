@@ -274,18 +274,28 @@ class MongoMapreduceAPI:
                 startValue = rangeStart[range_key]
                 if range_key in objectIdKeys:
                     startValue = bson.ObjectId(startValue)
-                filter["$and"].append({range_key:{"$gte":startValue}})
                 if rangeEnd:
                     endValue = rangeEnd[range_key]
                     if range_key in objectIdKeys:
                         endValue = bson.ObjectId(endValue)
                     filter["$and"].append({range_key:{"$lt":endValue}})
+                    filter["$and"].append({range_key:{"$gte":startValue}})
+                    cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+                        filter,
+                        batch_size=batch_size,
+                        sort=sort
+                    )
+                else:
+                    sort_backwards = []
+                    for key, value in enumerate(sort):
+                        sort_backwards.append((key, value * -1))
+                    cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+                        filter,
+                        batch_size=batch_size,
+                        sort=sort_backwards
+                    )
             print(sort)
-            cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
-                filter,
-                batch_size=batch_size,
-                sort=sort
-            )
+
             do_work_function = worker_functions[stage["functionName"]]
             continue_working = True
             reduce_key = None

@@ -161,10 +161,15 @@ class MongoMapreduceAPI:
         initialize_timeout = job["initializeTimeout"]
         update_time = int(time.time()) + (initialize_timeout / 2)
         collection = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]]
-        for x in range(1,chunks+1):
-            return_docs = list(collection.find(filter=init_query).sort(sort).skip(skip*x).limit(1))
+        for x in range(0,chunks):
+            if x < chunks:
+                return_docs = list(collection.find(filter=init_query).sort(sort).skip(skip*x).limit(1))
+            else:
+                sort_backwards = [(key, value * -1) for key, value in sort]
+                return_docs = list(collection.find(filter=init_query).sort(sort_backwards).limit(1))
+
             if return_docs:
-                range_doc = {}
+                range_values_doc = {}
                 for key in sort_keys:
                     value = return_docs[0][key]
                     if isinstance(value, bson.objectid.ObjectId):
@@ -184,12 +189,12 @@ class MongoMapreduceAPI:
                         )
                     else:
                         notObjectIdKeys.add(key)
-                    range_doc[key] = value
+                    range_values_doc[key] = value
                 if range_docs:
-                    if range_docs[-1] != range_doc:
-                        range_docs.append(range_doc)
+                    if range_docs[-1]["values"] != range_values_doc:
+                        range_docs.append({"values": range_values_doc})
                 else:
-                    range_docs.append(range_doc)
+                    range_docs.append({"values": range_values_doc})
             else:
                 break
             if int(time.time()) >= update_time:
@@ -270,37 +275,28 @@ class MongoMapreduceAPI:
             rangeEnd = work_get_payload["rangeEnd"]
             filter.setdefault("$and", [])
             objectIdKeys = work_get_payload.get("objectIdKeys", [])
+            print(rangeStart)
+            print(rangeEnd)
             for range_key in rangeStart.keys():
                 startValue = rangeStart[range_key]
                 if range_key in objectIdKeys:
                     startValue = bson.ObjectId(startValue)
+                filter["$and"].append({range_key:{"$gte":startValue}})
                 if rangeEnd:
                     endValue = rangeEnd[range_key]
                     if range_key in objectIdKeys:
                         endValue = bson.ObjectId(endValue)
                     filter["$and"].append({range_key:{"$lt":endValue}})
-                    filter["$and"].append({range_key:{"$gte":startValue}})
-                    cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
-                        filter,
-                        batch_size=batch_size,
-                        sort=sort
-                    )
-                else:
-                    sort_backwards = []
-                    for key, value in enumerate(sort):
-                        sort_backwards.append((key, value * -1))
-                    cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
-                        filter,
-                        batch_size=batch_size,
-                        sort=sort_backwards
-                    )
-            print(sort)
-
+            cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+                filter,
+                batch_size=batch_size,
+                sort=sort
+            )
             do_work_function = worker_functions[stage["functionName"]]
             continue_working = True
             reduce_key = None
             reduce_values = []
-            resultId = str(bson.ObjectId)
+            resultId = str(bson.ObjectId())
             while continue_working:
                 if not self.continue_working:
                     return
@@ -323,14 +319,14 @@ class MongoMapreduceAPI:
                         break
                 if work_get_payload["action"] == "map":
                     output_docs = {}
-                    results = do_work_function(documents)
-                    for key, value in results:
+                    for doc in documents:
+                        key, value = do_work_function(doc)
                         output_docs.setdefault(key, [])
                         output_docs[key].append(value)
                     output_keys = list(output_docs.keys())
                     for key in output_keys:
                         values = output_docs[key]
-                        insert_docs.append({"key": key, values: values})
+                        insert_docs.append({"key": key, "values": values})
                 elif work_get_payload["action"] == "reduce":
                     for doc in documents:
                         if doc["key"] != reduce_key:

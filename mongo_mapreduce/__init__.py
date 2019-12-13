@@ -3,7 +3,6 @@ import logging
 import math
 import time
 import traceback
-import sys
 
 import bson
 import pymongo
@@ -243,7 +242,7 @@ class MongoMapreduceAPI:
         )
         self.api_call("post", cleanup_url)
 
-    def run(self, projectId, worker_functions, queue=None, batch_size=100):
+    def run(self, projectId, worker_functions, queue=None):
         self.worker_functions = worker_functions
         self.continue_working = True
         self.last_ping_epoch = 0
@@ -532,15 +531,16 @@ class MongoMapreduceJob(collections.UserDict):
             time.sleep(10)
         if self["running"]:
             raise TimeoutError("Timed out waiting for job to complete")
-        if not self["complete"]:
-            raise JobNotCompleteError("Job has errors")
         result = self.get_result()
         return result
 
     def get_result(self):
-        if not self["complete"]:
+        if self["running"]:
             raise JobRunningError("Cannot get result until job is complete.  See wait_for_result")
-        if len(self["stages"]) < 2:
+        elif "errorInfo" in self:
+            error_info = self["errorInfo"]
+            raise JobNotCompleteError("Job has errors: \n" + error_info["traceback"])
+        elif len(self["stages"]) < 2:
             raise ValueError("Cannot get result for a job which does not specify a reduce function")
         reduce_stage = self["stages"][1]
         cursor = self.api.mongo_client[reduce_stage["outputDatabase"]][reduce_stage["outputCollection"]].find()

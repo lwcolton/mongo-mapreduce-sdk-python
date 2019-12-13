@@ -85,7 +85,8 @@ class MongoMapreduceAPI:
         if finalizeFunctionName:
             request_payload["finalizeFunctionName"] = finalizeFunctionName
         response = self.api_call("post", url, json=request_payload)
-        return response.json()["job"]
+        job_data = response.json()["job"]
+        return MongoMapreduceJob(job_data, self)
 
     def list_jobs(self, projectId=None, filter=None, sort=None, page=None, perPage=None, timeout=(10,10)):
         if type(projectId) != str or not projectId:
@@ -106,7 +107,10 @@ class MongoMapreduceAPI:
         url = self.get_url("/api/v1/projects/{projectId}/jobs_search".format(projectId=projectId))
         response = self.api_call("post", url, json=request_payload, timeout=timeout)
         response_payload = response.json()
-        return response_payload["jobs"]
+        jobs = []
+        for job_data in response_payload["jobs"]:
+            jobs.append(MongoMapreduceJob(job_data, self))
+        return jobs
 
     def get_job(self, projectId, jobId):
         url = self.get_url(
@@ -115,9 +119,10 @@ class MongoMapreduceAPI:
             )
         )
         response = self.api_call("get", url)
-        return response.json()["job"]
+        job_data = response.json()["job"]
+        return MongoMapreduceJob(job_data, self)
 
-    def initialize(self, projectId, job, workerId):
+    def _initialize(self, projectId, job):
         self.logger.info("Initializing")
         stageIndex = job["currentStageIndex"]
         init_url = self.get_url(
@@ -125,29 +130,33 @@ class MongoMapreduceAPI:
                 projectId = projectId, jobId=job["_id"], stageIndex=stageIndex
             )
         )
-        init_post_response = self.api_call("post", init_url, json={"workerId":workerId})
+        init_post_response = self.api_call("post", init_url, json={"workerId":self.workerId})
         if init_post_response.status_code == 204:
             return
         init_post_response_body = init_post_response.json()
-
-        stage = init_post_response_body["job"]["stages"][stageIndex]
+        job = init_post_response_body["job"]
+        stage = job["stages"][stageIndex]
         collection_namespace = "{0}.{1}".format(stage["inputDatabase"], stage["inputCollection"])
         collections_bson = list(self.mongo_client.config.collections.find_raw_batches({"_id":collection_namespace}))
         init_query = None
-        if collections_bson[0]:
-            codec_options = bson.CodecOptions(document_class=collections.OrderedDict)
-            collection_info = bson.BSON.decode(collections_bson[0], codec_options=codec_options)
-            key = collection_info["key"]
-            sort_keys = list(key.keys())
-            sort = [(sort_key, key[sort_key]) for sort_key in sort_keys]
-            if sort_keys[0] in job["query"]:
-                init_query = {}
-                for index_key in sort_keys:
-                    if index_key in job["query"]:
-                        init_query[index_key] = job["query"][index_key]
+        if stageIndex == 0:
+            if collections_bson[0]:
+                codec_options = bson.CodecOptions(document_class=collections.OrderedDict)
+                collection_info = bson.BSON.decode(collections_bson[0], codec_options=codec_options)
+                key = collection_info["key"]
+                sort_keys = list(key.keys())
+                sort = [(sort_key, key[sort_key]) for sort_key in sort_keys]
+                if sort_keys[0] in job["query"]:
+                    init_query = {}
+                    for index_key in sort_keys:
+                        if index_key in job["query"]:
+                            init_query[index_key] = job["query"][index_key]
+            else:
+                sort_keys = ["_id"]
+                sort = [("_id", 1)]
         else:
-            sort_keys = ["_id"]
-            sort = [("_id", 1)]
+            sort_keys = ["key"]
+            sort = [("key", 1)]
         major_version, minor_version, patch_version = pymongo.version_tuple
         if (major_version == 3 and minor_version >= 7) or major_version > 3:
             count = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].estimated_document_count()
@@ -198,7 +207,7 @@ class MongoMapreduceAPI:
             else:
                 break
             if int(time.time()) >= update_time:
-                self.api_call("patch", init_url, json={"workerId":workerId})
+                self.api_call("patch", init_url, json={"workerId":self.workerId})
                 update_time = int(time.time()) + (initialize_timeout / 2)
         init_put_payload = {
             "ranges": range_docs,
@@ -206,9 +215,24 @@ class MongoMapreduceAPI:
         }
         self.api_call("put", init_url, json=init_put_payload)
 
-    def cleanup(self, projectId, job):
+    def _cleanup(self, projectId, job):
         map_stage = job["stages"][0]
         self.mongo_client[map_stage["outputDatabase"]][job["tempCollectionName"]].drop()
+        if "reduceFunctionName" in job:
+            range_url = self.get_url(
+                "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges".format(
+                    projectId=projectId, jobId=job["_id"], stageIndex=1
+                )
+            )
+            range_response = self.api_call("get", range_url)
+            range_payload = range_response.json()
+            result_ids = []
+            for range in range_payload["ranges"]:
+                result_ids.append(range["resultId"])
+            reduce_stage = job["stages"][1]
+            self.mongo_client[reduce_stage["outputDatabase"]][reduce_stage["outputCollection"]].delete_many({
+                "resultId":{"$not":{"$in":result_ids}}
+            })
         cleanup_url = self.get_url(
             "/api/v1/projects/{projectId}/jobs/{jobId}/cleanup".format(
                 projectId=projectId, jobId=job["_id"]
@@ -217,8 +241,10 @@ class MongoMapreduceAPI:
         self.api_call("post", cleanup_url)
 
     def run(self, projectId, worker_functions, queue=None, batch_size=100):
+        self.worker_functions = worker_functions
         self.continue_working = True
-        workerId = str(bson.ObjectId())
+        self.last_ping_epoch = 0
+        self.workerId = str(bson.ObjectId())
         while self.continue_working:
             work_url = self.get_url(
                 "/api/v1/projects/{projectId}/work".format(
@@ -235,126 +261,231 @@ class MongoMapreduceAPI:
                 time.sleep(10)
                 work_get_response = self.api_call("get", work_url, params=params)
             work_get_payload = work_get_response.json()
+            resultId = str(bson.ObjectId())
             job = work_get_payload["job"]
             if work_get_payload["action"] == "initialize":
-                self.initialize(projectId, job, workerId)
+                self._initialize(projectId, job)
                 continue
             elif work_get_payload["action"] == "cleanup":
-                self.cleanup(projectId, job)
+                self._cleanup(projectId, job)
                 continue
+            rangeIndex = work_get_payload["rangeIndex"]
             range_url = self.get_url(
                 "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges/{rangeIndex}".format(
                     projectId=projectId,
                     jobId=job["_id"],
                     stageIndex=job["currentStageIndex"],
-                    rangeIndex=work_get_payload["rangeIndex"]
+                    rangeIndex=rangeIndex
                 )
             )
-            work_timeout = job["workTimeout"]
-            previousInitializingAtEpoch = job["stages"][job["currentStageIndex"]]["initializingAtEpoch"]
-            update_time = previousInitializingAtEpoch + (work_timeout / 2)
-            post_response = self.api_call("post", range_url, json={"workerId": workerId})
+            post_response = self.api_call("post", range_url, json={"workerId": self.workerId})
             if post_response.status_code == 204:
                 continue
-            stage = job["stages"][job["currentStageIndex"]]
-            filter = {}
-            sort = None
+
             if work_get_payload["action"] == "map":
-                filter = job.get("filter", {})
-                sort = job.get("sort")
+                self._map(work_get_payload, job, resultId)
             elif work_get_payload["action"] == "reduce":
-                map_ranges_url = "/api/v1/projects/{projectId}/jobs/{jobId}/stages/0/ranges".format(
-                    projectId=projectId, jobId=job["_id"]
-                )
-                map_ranges_response = self.api_call("get", map_ranges_url)
-                map_ranges_payload = map_ranges_response.json()
-                valid_result_ids = [map_range["resultId"] for map_range in map_ranges_payload["ranges"]]
-                filter = {"resultId":{"$in":valid_result_ids}}
-                sort = [("key", pymongo.ASCENDING)]
-            rangeStart = work_get_payload.get("rangeStart")
-            rangeEnd = work_get_payload["rangeEnd"]
-            filter.setdefault("$and", [])
-            objectIdKeys = work_get_payload.get("objectIdKeys", [])
-            for range_key in rangeStart.keys():
-                startValue = rangeStart[range_key]
-                if range_key in objectIdKeys:
-                    startValue = bson.ObjectId(startValue)
-                filter["$and"].append({range_key:{"$gte":startValue}})
-                if rangeEnd:
-                    endValue = rangeEnd[range_key]
-                    if range_key in objectIdKeys:
-                        endValue = bson.ObjectId(endValue)
-                    filter["$and"].append({range_key:{"$lt":endValue}})
-            cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
-                filter,
-                batch_size=batch_size,
-                sort=sort
+                self._reduce(work_get_payload, job, resultId)
+            self.api_call("put", range_url, json={"resultId": resultId})
+
+    def _ping_range(self, job, rangeIndex):
+        range_url = self.get_url(
+            "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges/{rangeIndex}".format(
+                projectId=job["projectId"],
+                jobId=job["_id"],
+                stageIndex=job["currentStageIndex"],
+                rangeIndex=rangeIndex
             )
-            do_work_function = worker_functions[stage["functionName"]]
-            continue_working = True
-            reduce_key = None
-            reduce_values = []
-            resultId = str(bson.ObjectId())
-            while continue_working:
+        )
+        update_time = self.last_ping_epoch + (job["workTimeout"] / 2)
+        if int(time.time()) > update_time:
+            patch_response = self.api_call("patch", range_url, json={"workerId": self.workerId})
+            return patch_response
+
+    def build_range_filter(self, rangeStart, rangeEnd=None, objectIdKeys=None):
+        range_filter = []
+        if objectIdKeys is None:
+            objectIdKeys = set()
+        for range_key in rangeStart.keys():
+            startValue = rangeStart[range_key]
+            if range_key in objectIdKeys:
+                startValue = bson.ObjectId(startValue)
+            range_filter.append({range_key: {"$gte": startValue}})
+            if rangeEnd:
+                endValue = rangeEnd[range_key]
+                if range_key in objectIdKeys:
+                    endValue = bson.ObjectId(endValue)
+                range_filter.append({range_key: {"$lt": endValue}})
+        return range_filter
+
+    def _get_batch(self, cursor, batch_size):
+        documents = []
+        for x in range(0, batch_size):
+            if not self.continue_working:
+                return
+            try:
+                documents.append(cursor.next())
+            except StopIteration:
+                break
+        return documents
+
+    def _map(self, work_payload, job, resultId, batch_size=100):
+        rangeStart = work_payload["rangeStart"]
+        rangeEnd = work_payload.get("rangeEnd")
+        objectIdKeys = work_payload.get("objectIdKeys", [])
+        range_filter = self.build_range_filter(rangeStart, rangeEnd=rangeEnd, objectIdKeys=objectIdKeys)
+        query = job.get("filter", {})
+        query.setdefault("$and", [])
+        query["$and"] += range_filter
+        sort = job.get("sort")
+        stage = job["stages"][0]
+        cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+            query,
+            batch_size=batch_size,
+            sort=sort
+        )
+        map_function_name = stage["functionName"]
+        map_function = self.worker_functions[map_function_name]
+        documents = self._get_batch(cursor, batch_size)
+        while documents:
+            insert_docs = []
+            mapped_values = {}
+            for doc in documents:
                 if not self.continue_working:
                     return
-                if int(time.time()) > update_time:
-                    update_time = int(time.time()) + (work_timeout / 2)
-                    patch_response = self.api_call("patch", range_url, json={"workerId": workerId})
-                    if patch_response.status_code == 204:
-                        break
-                documents = []
-                insert_docs = []
-                for x in range(0, batch_size):
-                    try:
-                        documents.append(cursor.next())
-                    except StopIteration:
-                        continue_working = False
-                        break
-                if work_get_payload["action"] == "map":
-                    output_docs = {}
-                    for doc in documents:
-                        key, value = do_work_function(doc)
-                        output_docs.setdefault(key, [])
-                        output_docs[key].append(value)
-                    output_keys = list(output_docs.keys())
-                    for key in output_keys:
-                        values = output_docs[key]
-                        insert_docs.append({"key": key, "values": values})
-                elif work_get_payload["action"] == "reduce":
-                    for doc in documents:
-                        if doc["key"] != reduce_key:
-                            reduced_value = do_work_function(reduce_key, reduce_values)
-                            insert_docs.append({"_id": reduce_key, "value": reduced_value})
-                            reduce_values = [doc["value"]]
-                            reduce_key = doc["key"]
-                        else:
-                            reduce_values.append(doc["value"])
-                    if len(reduce_values) > 1:
-                        reduce_values = [do_work_function(reduce_values)]
-                elif work_get_payload["action"] == "finalize":
-                    for doc in documents:
-                        finalized_value = do_work_function(doc["_id"], doc["value"])
-                        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].find_one_and_update(
-                            {
-                                "_id":doc["_id"],
-                                "finalized":{"$exists":False}
-                            },
-                            {
-                                "$set":{
-                                    "value": finalized_value,
-                                    "finalized": True
-                                }
-                            }
-                        )
-                if insert_docs:
-                    for doc in insert_docs:
-                        doc["resultId"] = resultId
-                    try:
-                        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_many(insert_docs)
-                    except pymongo.errors.DuplicateKeyError as duplicate_key_error:
-                        pass
-            self.api_call("put", range_url, json={"resultId": resultId})
+                key, value = map_function(doc)
+                mapped_values.setdefault(key, [])
+                mapped_values[key].append(value)
+            for key in mapped_values.keys():
+                values = mapped_values[key]
+                insert_docs.append({"key": key, "values": values})
+            if insert_docs:
+                for doc in insert_docs:
+                    doc["resultId"] = resultId
+                try:
+                    self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_many(insert_docs)
+                except pymongo.errors.DuplicateKeyError as duplicate_key_error:
+                    pass
+            documents = self._get_batch(cursor, batch_size)
+
+    def _reduce(self, work_payload, job, resultId):
+        map_ranges_url = self.get_url("/api/v1/projects/{projectId}/jobs/{jobId}/stages/0/ranges".format(
+            projectId=job["projectId"], jobId=job["_id"]
+        ))
+        map_ranges_response = self.api_call("get", map_ranges_url)
+        map_ranges_payload = map_ranges_response.json()
+        stage = job["stages"][1]
+        reduce_function_name = stage["functionName"]
+        reduce_function = self.worker_functions[reduce_function_name]
+        valid_result_ids = [map_range["resultId"] for map_range in map_ranges_payload["ranges"]]
+        rangeStart = work_payload["rangeStart"]
+        rangeEnd = work_payload.get("rangeEnd")
+        range_filter = self.build_range_filter(rangeStart, rangeEnd=rangeEnd)
+        query = {
+            "resultId": {"$in": valid_result_ids},
+            "$and": range_filter
+        }
+        cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+            query,
+            sort=[("key", pymongo.ASCENDING)]
+        )
+        previous_key = None
+        values = []
+        for document in cursor:
+            key = document["key"]
+            if previous_key != key:
+                if len(values) > 0:
+                    if len(values) > 1:
+                        value = reduce_function(values)
+                    else:
+                        value = values[0]
+                    self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_one(
+                        {
+                            "_id": previous_key,
+                            "value":value,
+                            "resultId": resultId
+                        }
+                    )
+                    values = []
+            else:
+                if len(values) > 10:
+                    values = [reduce_function(values)]
+            values += document["values"]
+            previous_key = key
+        if len(values) > 1:
+            value = reduce_function(values)
+        else:
+            value = values[0]
+        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_one(
+            {
+                "_id": previous_key,
+                "value": value,
+                "resultId": resultId
+            }
+        )
+
+
+    def finalize(self, finalize_function, documents, stage):
+        for doc in documents:
+            if doc.get("finalized"):
+                continue
+            finalized_value = finalize_function(doc["_id"], doc["value"])
+            self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].find_one_and_update(
+                {
+                    "_id": doc["_id"],
+                    "finalized": {"$exists": False}
+                },
+                {
+                    "$set": {
+                        "value": finalized_value,
+                        "finalized": True
+                    }
+                }
+            )
 
     def stop(self):
         self.continue_working = False
+
+class MongoMapreduceError(Exception):
+    pass
+
+class JobNotCompleteError(MongoMapreduceError):
+    pass
+
+class TimeoutError(MongoMapreduceError):
+    pass
+
+class MongoMapreduceJob(collections.UserDict):
+    def __init__(self, data, api):
+        super(MongoMapreduceJob, self).__init__(data)
+        self.api = api
+
+    def wait_for_result(self, timeout=None):
+        job_url = self.api.get_url(
+            "/api/v1/projects/{projectId}/jobs/{jobId}".format(
+                projectId = self["projectId"],
+                jobId = self["_id"]
+            )
+        )
+        start_time = int(time.time())
+        while not self["complete"]:
+            if timeout:
+                if int(time.time()) > start_time + timeout:
+                    break
+            job_response = self.api.api_call(job_url)
+            self.data = job_response["job"]
+            time.sleep(10)
+        if not self["complete"]:
+            raise TimeoutError("Timed out waiting for job to complete")
+        result = self.get_result()
+        return result
+
+    def get_result(self):
+        if not self["complete"]:
+            raise JobNotCompleteError("Cannot get result until job is complete.  See wait_for_result")
+        if len(self["stages"]) < 2:
+            raise ValueError("Cannot get result for a job which does not specify a reduce function")
+        reduce_stage = self["stages"][1]
+        cursor = self.api.mongo_client[reduce_stage["outputDatabase"]][reduce_stage["outputCollection"]].find()
+        for document in cursor:
+            yield document["_id"], document["value"]

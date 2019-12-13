@@ -2,6 +2,8 @@ import collections
 import logging
 import math
 import time
+import traceback
+import sys
 
 import bson
 import pymongo
@@ -136,6 +138,7 @@ class MongoMapreduceAPI:
         init_post_response_body = init_post_response.json()
         job = init_post_response_body["job"]
         stage = job["stages"][stageIndex]
+        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].drop()
         collection_namespace = "{0}.{1}".format(stage["inputDatabase"], stage["inputCollection"])
         collections_bson = list(self.mongo_client.config.collections.find_raw_batches({"_id":collection_namespace}))
         init_query = None
@@ -261,14 +264,29 @@ class MongoMapreduceAPI:
                 time.sleep(10)
                 work_get_response = self.api_call("get", work_url, params=params)
             work_get_payload = work_get_response.json()
-            resultId = str(bson.ObjectId())
             job = work_get_payload["job"]
+            try:
+                self._process_work(projectId, job, work_get_payload)
+            except Exception as run_error:
+                error_url = self.get_url(
+                    "/api/v1/projects/{projectId}/jobs/{jobId}/error".format(
+                        projectId=projectId, jobId=job["_id"]
+                    )
+                )
+                error_payload = {
+                    "traceback": traceback.format_exc(),
+                    "message": "\n".join(traceback.format_exception_only(run_error.__class__, run_error)),
+                    "stageIndex": job["currentStageIndex"]
+                }
+                self.api_call("post", error_url, json=error_payload)
+
+    def _process_work(self, projectId, job, work_get_payload):
             if work_get_payload["action"] == "initialize":
                 self._initialize(projectId, job)
-                continue
+                return
             elif work_get_payload["action"] == "cleanup":
                 self._cleanup(projectId, job)
-                continue
+                return
             rangeIndex = work_get_payload["rangeIndex"]
             range_url = self.get_url(
                 "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges/{rangeIndex}".format(
@@ -280,12 +298,14 @@ class MongoMapreduceAPI:
             )
             post_response = self.api_call("post", range_url, json={"workerId": self.workerId})
             if post_response.status_code == 204:
-                continue
-
+                return
+            resultId = str(bson.ObjectId())
             if work_get_payload["action"] == "map":
                 self._map(work_get_payload, job, resultId)
             elif work_get_payload["action"] == "reduce":
                 self._reduce(work_get_payload, job, resultId)
+            elif work_get_payload["action"] == "finalize":
+                self._finalize(work_get_payload, job)
             self.api_call("put", range_url, json={"resultId": resultId})
 
     def _ping_range(self, job, rangeIndex):
@@ -298,11 +318,13 @@ class MongoMapreduceAPI:
             )
         )
         update_time = self.last_ping_epoch + (job["workTimeout"] / 2)
-        if int(time.time()) > update_time:
+        current_time = int(time.time())
+        if current_time >= update_time:
+            self.last_ping_epoch = current_time
             patch_response = self.api_call("patch", range_url, json={"workerId": self.workerId})
             return patch_response
 
-    def build_range_filter(self, rangeStart, rangeEnd=None, objectIdKeys=None):
+    def _build_range_filter(self, rangeStart, rangeEnd=None, objectIdKeys=None):
         range_filter = []
         if objectIdKeys is None:
             objectIdKeys = set()
@@ -333,7 +355,7 @@ class MongoMapreduceAPI:
         rangeStart = work_payload["rangeStart"]
         rangeEnd = work_payload.get("rangeEnd")
         objectIdKeys = work_payload.get("objectIdKeys", [])
-        range_filter = self.build_range_filter(rangeStart, rangeEnd=rangeEnd, objectIdKeys=objectIdKeys)
+        range_filter = self._build_range_filter(rangeStart, rangeEnd=rangeEnd, objectIdKeys=objectIdKeys)
         query = job.get("filter", {})
         query.setdefault("$and", [])
         query["$and"] += range_filter
@@ -348,6 +370,10 @@ class MongoMapreduceAPI:
         map_function = self.worker_functions[map_function_name]
         documents = self._get_batch(cursor, batch_size)
         while documents:
+            ping_response = self._ping_range(job, work_payload["rangeIndex"])
+            if ping_response is not None:
+                if ping_response.status_code == 204:
+                    break
             insert_docs = []
             mapped_values = {}
             for doc in documents:
@@ -380,7 +406,7 @@ class MongoMapreduceAPI:
         valid_result_ids = [map_range["resultId"] for map_range in map_ranges_payload["ranges"]]
         rangeStart = work_payload["rangeStart"]
         rangeEnd = work_payload.get("rangeEnd")
-        range_filter = self.build_range_filter(rangeStart, rangeEnd=rangeEnd)
+        range_filter = self._build_range_filter(rangeStart, rangeEnd=rangeEnd)
         query = {
             "resultId": {"$in": valid_result_ids},
             "$and": range_filter
@@ -391,7 +417,15 @@ class MongoMapreduceAPI:
         )
         previous_key = None
         values = []
+        doc_count = 0
         for document in cursor:
+            doc_count += 1
+            if doc_count >= 100:
+                ping_response = self._ping_range(job, work_payload["rangeIndex"])
+                if ping_response is not None:
+                    if ping_response.status_code == 204:
+                        break
+                doc_count = 0
             key = document["key"]
             if previous_key != key:
                 if len(values) > 0:
@@ -425,14 +459,31 @@ class MongoMapreduceAPI:
         )
 
 
-    def finalize(self, finalize_function, documents, stage):
-        for doc in documents:
-            if doc.get("finalized"):
+    def _finalize(self, work_payload, job):
+        stage = job["stages"][2]
+        finalize_function_name = stage["functionName"]
+        finalize_function = self.worker_functions[finalize_function_name]
+        rangeStart = work_payload["rangeStart"]
+        rangeEnd = work_payload.get("rangeEnd")
+        range_filter = self._build_range_filter(rangeStart, rangeEnd=rangeEnd)
+        query = {"$and":range_filter}
+        cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+            query
+        )
+        doc_count = 0
+        for document in cursor:
+            doc_count += 1
+            if doc_count >= 100:
+                ping_response = self._ping_range(job, work_payload["rangeIndex"])
+                if ping_response is not None:
+                    if ping_response.status_code == 204:
+                        break
+            if document.get("finalized"):
                 continue
-            finalized_value = finalize_function(doc["_id"], doc["value"])
+            finalized_value = finalize_function(document["_id"], document["value"])
             self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].find_one_and_update(
                 {
-                    "_id": doc["_id"],
+                    "_id": document["_id"],
                     "finalized": {"$exists": False}
                 },
                 {
@@ -452,6 +503,9 @@ class MongoMapreduceError(Exception):
 class JobNotCompleteError(MongoMapreduceError):
     pass
 
+class JobRunningError(MongoMapreduceError):
+    pass
+
 class TimeoutError(MongoMapreduceError):
     pass
 
@@ -468,21 +522,24 @@ class MongoMapreduceJob(collections.UserDict):
             )
         )
         start_time = int(time.time())
-        while not self["complete"]:
+        while self["running"]:
             if timeout:
                 if int(time.time()) > start_time + timeout:
                     break
-            job_response = self.api.api_call(job_url)
-            self.data = job_response["job"]
+            job_response = self.api.api_call("get", job_url)
+            job_payload = job_response.json()
+            self.data = job_payload["job"]
             time.sleep(10)
-        if not self["complete"]:
+        if self["running"]:
             raise TimeoutError("Timed out waiting for job to complete")
+        if not self["complete"]:
+            raise JobNotCompleteError("Job has errors")
         result = self.get_result()
         return result
 
     def get_result(self):
         if not self["complete"]:
-            raise JobNotCompleteError("Cannot get result until job is complete.  See wait_for_result")
+            raise JobRunningError("Cannot get result until job is complete.  See wait_for_result")
         if len(self["stages"]) < 2:
             raise ValueError("Cannot get result for a job which does not specify a reduce function")
         reduce_stage = self["stages"][1]

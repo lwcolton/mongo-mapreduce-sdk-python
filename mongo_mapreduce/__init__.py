@@ -323,8 +323,6 @@ class MongoMapreduceAPI:
                 self._map(work_get_payload, job, resultId)
             elif work_get_payload["action"] == "reduce":
                 self._reduce(work_get_payload, job, resultId)
-            elif work_get_payload["action"] == "finalize":
-                self._finalize(work_get_payload, job)
             self.api_call("put", range_url, json={"resultId": resultId})
 
     def _ping_range(self, job, rangeIndex):
@@ -426,6 +424,10 @@ class MongoMapreduceAPI:
         rangeStart = work_payload["rangeStart"]
         rangeEnd = work_payload.get("rangeEnd")
         range_filter = self._build_range_filter(rangeStart, rangeEnd=rangeEnd)
+        finalize_function = None
+        finalize_function_name = job.get("finalizeFunctionName")
+        if finalize_function_name:
+            finalize_function = self.worker_functions[finalize_function_name]
         query = {
             "resultId": {"$in": valid_result_ids},
             "$and": range_filter
@@ -452,6 +454,8 @@ class MongoMapreduceAPI:
                         value = reduce_function(values)
                     else:
                         value = values[0]
+                    if finalize_function:
+                        value = finalize_function(previous_key, value)
                     self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_one(
                         {
                             "_id": previous_key,
@@ -469,6 +473,8 @@ class MongoMapreduceAPI:
             value = reduce_function(values)
         else:
             value = values[0]
+        if finalize_function:
+            value = finalize_function(previous_key, value)
         self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_one(
             {
                 "_id": previous_key,
@@ -477,41 +483,6 @@ class MongoMapreduceAPI:
             }
         )
 
-
-    def _finalize(self, work_payload, job):
-        stage = job["stages"][2]
-        finalize_function_name = stage["functionName"]
-        finalize_function = self.worker_functions[finalize_function_name]
-        rangeStart = work_payload["rangeStart"]
-        rangeEnd = work_payload.get("rangeEnd")
-        range_filter = self._build_range_filter(rangeStart, rangeEnd=rangeEnd)
-        query = {"$and":range_filter}
-        cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
-            query
-        )
-        doc_count = 0
-        for document in cursor:
-            doc_count += 1
-            if doc_count >= 100:
-                ping_response = self._ping_range(job, work_payload["rangeIndex"])
-                if ping_response is not None:
-                    if ping_response.status_code == 204:
-                        break
-            if document.get("finalized"):
-                continue
-            finalized_value = finalize_function(document["_id"], document["value"])
-            self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].find_one_and_update(
-                {
-                    "_id": document["_id"],
-                    "finalized": {"$exists": False}
-                },
-                {
-                    "$set": {
-                        "value": finalized_value,
-                        "finalized": True
-                    }
-                }
-            )
 
     def stop(self):
         self.continue_working = False

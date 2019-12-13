@@ -123,6 +123,22 @@ class MongoMapreduceAPI:
         job_data = response.json()["job"]
         return MongoMapreduceJob(job_data, self)
 
+    def _error_is_sharding_not_enabled(self, error):
+        error_message = str(error)
+        if not isinstance(error, pymongo.errors.OperationFailure):
+            return False
+        if "not found" in error_message or "sharding not enabled" in error_message:
+            return True
+        return False
+
+    def _shard_output(self, stage):
+        output_namespace = "{0}.{1}".format(stage["outputDatabase"], stage["outputCollection"])
+        try:
+            self.mongo_client.admin.command('shardCollection', output_namespace, key={'_id': 1})
+        except pymongo.errors.OperationFailure as operation_failure:
+            if not self._error_is_sharding_not_enabled(operation_failure):
+                raise operation_failure
+
     def _initialize(self, projectId, job):
         self.logger.info("Initializing")
         stageIndex = job["currentStageIndex"]
@@ -138,10 +154,11 @@ class MongoMapreduceAPI:
         job = init_post_response_body["job"]
         stage = job["stages"][stageIndex]
         self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].drop()
-        collection_namespace = "{0}.{1}".format(stage["inputDatabase"], stage["inputCollection"])
-        collections_bson = list(self.mongo_client.config.collections.find_raw_batches({"_id":collection_namespace}))
+        input_namespace = "{0}.{1}".format(stage["inputDatabase"], stage["inputCollection"])
+        collections_bson = list(self.mongo_client.config.collections.find_raw_batches({"_id":input_namespace}))
         init_query = None
         if stageIndex == 0:
+            self._shard_output(stage)
             if collections_bson[0]:
                 codec_options = bson.CodecOptions(document_class=collections.OrderedDict)
                 collection_info = bson.BSON.decode(collections_bson[0], codec_options=codec_options)
@@ -159,6 +176,9 @@ class MongoMapreduceAPI:
         else:
             sort_keys = ["key"]
             sort = [("key", 1)]
+        if stageIndex == 1:
+            self._shard_output(stage)
+
         major_version, minor_version, patch_version = pymongo.version_tuple
         if (major_version == 3 and minor_version >= 7) or major_version > 3:
             count = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].estimated_document_count()

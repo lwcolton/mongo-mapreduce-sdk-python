@@ -445,7 +445,7 @@ class MongoMapreduceAPI:
                 ping_response = self._ping_range(job, work_payload["rangeIndex"])
                 if ping_response is not None:
                     if ping_response.status_code == 204:
-                        break
+                        return
                 doc_count = 0
             key = document["key"]
             if previous_key != key:

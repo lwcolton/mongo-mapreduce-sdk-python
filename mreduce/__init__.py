@@ -11,7 +11,7 @@ import requests
 import requests.exceptions
 
 
-class MongoMapreduceAPI:
+class MReduceAPI:
     def __init__(self, api_key=None, mongo_client=None, host="localhost", logger=None):
         if type(api_key) != str:
             raise ValueError("Must supply api_key, type str")

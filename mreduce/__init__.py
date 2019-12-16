@@ -11,7 +11,7 @@ import requests
 import requests.exceptions
 
 
-class MReduceAPI:
+class API:
     def __init__(self, api_key=None, mongo_client=None, host="localhost", logger=None):
         if type(api_key) != str:
             raise ValueError("Must supply api_key, type str")
@@ -396,9 +396,9 @@ class MReduceAPI:
             for doc in documents:
                 if not self.continue_working:
                     return
-                key, value = map_function(doc)
-                mapped_values.setdefault(key, [])
-                mapped_values[key].append(value)
+                for key, value in map_function(doc):
+                    mapped_values.setdefault(key, [])
+                    mapped_values[key].append(value)
             for key in mapped_values.keys():
                 values = mapped_values[key]
                 insert_docs.append({"key": key, "values": values})

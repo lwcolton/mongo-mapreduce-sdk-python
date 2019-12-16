@@ -1,0 +1,14 @@
+version: '3'
+services:
+  docs:
+    build:
+      context: "../"
+      dockerfile: "docker/images/docs/Dockerfile"
+    ports:
+     - "8443:4433"
+    volumes:
+     - ./test_data/certs:/usr/local/apache2/certs
+    environment:
+      APACHE_CERT_PATH: fullchain.pem
+      APACHE_KEY_PATH: privkey.pem
+      DOCS_DOMAIN: localhost

@@ -12,6 +12,14 @@ Welcome to MReduce Python SDK's documentation!
 
    modules
 
+Quickstart
+==============================================
+.. code-block:: python
+
+      import mreduce
+
+      def map(documents):
+
 
 Indices and tables
 ==================

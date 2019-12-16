@@ -21,7 +21,7 @@ RUN sphinx-apidoc -o docs mreduce
 
 WORKDIR /opt/docs
 
-RUN rm -rf /usr/local/apache2/htdocs && ln -s /opt/docs/_build/html /usr/local/apache2/htdocs 
+RUN rm -rf /usr/local/apache2/htdocs && ln -s /opt/docs/_build/html /usr/local/apache2/htdocs
 
 RUN make html
 

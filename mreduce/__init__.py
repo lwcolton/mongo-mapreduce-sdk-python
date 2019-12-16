@@ -12,7 +12,7 @@ import requests.exceptions
 
 
 class API:
-    def __init__(self, api_key=None, mongo_client=None, host="localhost", logger=None):
+    def __init__(self, api_key=None, mongo_client=None, host="mreduce.com", logger=None):
         if type(api_key) != str:
             raise ValueError("Must supply api_key, type str")
         if not isinstance(mongo_client, pymongo.MongoClient):
@@ -451,7 +451,7 @@ class API:
             if previous_key != key:
                 if len(values) > 0:
                     if len(values) > 1:
-                        value = reduce_function(values)
+                        value = reduce_function(previous_key, values)
                     else:
                         value = values[0]
                     if finalize_function:
@@ -466,7 +466,7 @@ class API:
                     values = []
             else:
                 if len(values) > 10:
-                    values = [reduce_function(values)]
+                    values = [reduce_function(key, values)]
             values += document["values"]
             previous_key = key
         if len(values) > 1:

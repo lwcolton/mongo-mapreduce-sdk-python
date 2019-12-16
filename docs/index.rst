@@ -16,10 +16,60 @@ Quickstart
 ==============================================
 .. code-block:: python
 
-      import mreduce
+   import random
+   import threading
 
-      def map(documents):
+   import bson
+   import pymongo
 
+   import mreduce
+
+
+   mongo_client = pymongo.MongoClient("mongodb://your_mongodb_server")
+   test_collection = mogno_client.test.test_collection
+
+   for x in range(0, 100):
+       customer_id = str(bson.ObjectId())
+       documents = []
+       for x in rangdom.randrane(10, 100):
+           price = random.randrange(0,1000)
+           documents.append({"customer_id":customer_id, "price":price})
+      test_collection.insert_many(documents)
+
+   def map_func(document):
+       yield document["customer_id"], document["price"]
+
+   def reduce_func(customer_id, prices):
+       return sum(prices)
+
+   worker_functions = {
+       "exampleMap": map_func,
+       "exampleReduce": reduce_func
+   }
+
+   api = mreduce.API(
+       api_key = "...",
+       mongo_client = mongo_client
+   )
+
+   project = api.create_project("Test Project")
+
+   thread = threading.Thread(
+       target=api.run,
+       args=[project["_id"], worker_functions]
+   )
+   thread.start()
+
+   job = api.submit_job(
+       projectId=project["_id"],
+       mapFunctionName="exampleMap",
+       reduceFunctionName="exampleReduce",
+       inputDatabase="test",
+       inputCollection="test_collection",
+       outputDatabase="test",
+       outputCollection="test_results"
+   )
+   result = job.wait_for_result()
 
 Indices and tables
 ==================

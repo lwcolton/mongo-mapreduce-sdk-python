@@ -250,7 +250,8 @@ class API:
             range_payload = range_response.json()
             result_ids = []
             for range in range_payload["ranges"]:
-                result_ids.append(range["resultId"])
+                if "resultId" in range:
+                    result_ids.append(range["resultId"])
             reduce_stage = job["stages"][1]
             self.mongo_client[reduce_stage["outputDatabase"]][reduce_stage["outputCollection"]].delete_many({
                 "resultId":{"$not":{"$in":result_ids}}
@@ -470,7 +471,7 @@ class API:
             values += document["values"]
             previous_key = key
         if len(values) > 1:
-            value = reduce_function(values)
+            value = reduce_function(previous_key, values)
         else:
             value = values[0]
         if finalize_function:

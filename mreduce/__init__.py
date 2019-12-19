@@ -281,7 +281,7 @@ class API:
             while work_get_response.status_code == 204:
                 if not self.continue_working:
                     return
-                time.sleep(10)
+                time.sleep(.2)
                 work_get_response = self.api_call("get", work_url, params=params)
             work_get_payload = work_get_response.json()
             job = work_get_payload["job"]
@@ -513,25 +513,27 @@ class MongoMapreduceJob(collections.UserDict):
             )
         )
         start_time = int(time.time())
-        while self["running"]:
+        while self["status"] == "running":
             if timeout:
                 if int(time.time()) > start_time + timeout:
                     break
             job_response = self.api.api_call("get", job_url)
             job_payload = job_response.json()
             self.data = job_payload["job"]
-            time.sleep(10)
-        if self["running"]:
+            time.sleep(.2)
+        if self["status"] == "running":
             raise TimeoutError("Timed out waiting for job to complete")
         result = self.get_result()
         return result
 
     def get_result(self):
-        if self["running"]:
+        if self["status"] == "running":
             raise JobRunningError("Cannot get result until job is complete.  See wait_for_result")
-        elif "errorInfo" in self:
+        elif self["status"] == "error":
             error_info = self["errorInfo"]
             raise JobNotCompleteError("Job has errors: \n" + error_info["traceback"])
+        elif self["status"] != "complete":
+            raise JobNotCompleteError("Job not complete.  Status: " + self["status"])
         elif len(self["stages"]) < 2:
             raise ValueError("Cannot get result for a job which does not specify a reduce function")
         reduce_stage = self["stages"][1]

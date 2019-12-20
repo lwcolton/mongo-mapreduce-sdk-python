@@ -513,7 +513,7 @@ class MongoMapreduceJob(collections.UserDict):
             )
         )
         start_time = int(time.time())
-        while self["status"] == "running":
+        while self["status"] in ["running", "cleanup"]:
             if timeout:
                 if int(time.time()) > start_time + timeout:
                     break
@@ -521,7 +521,7 @@ class MongoMapreduceJob(collections.UserDict):
             job_payload = job_response.json()
             self.data = job_payload["job"]
             time.sleep(.2)
-        if self["status"] == "running":
+        if self["status"] in ["running", "cleanup"]:
             raise TimeoutError("Timed out waiting for job to complete")
         result = self.get_result()
         return result

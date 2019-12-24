@@ -131,34 +131,88 @@ class API:
             return True
         return False
 
-    def _shard_output(self, stage):
-        output_namespace = "{0}.{1}".format(stage["outputDatabase"], stage["outputCollection"])
+    def _shard_output(self, output_namespace):
         try:
             self.mongo_client.admin.command('shardCollection', output_namespace, key={'_id': 1})
         except pymongo.errors.OperationFailure as operation_failure:
             if not self._error_is_sharding_not_enabled(operation_failure):
                 raise operation_failure
 
-    def _initialize(self, projectId, job):
-        self.logger.info("Initializing")
-        stageIndex = job["currentStageIndex"]
-        init_url = self.get_url(
-            "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/initialize".format(
-                projectId = projectId, jobId=job["_id"], stageIndex=stageIndex
+    def run(self, projectId, worker_functions, queue=None):
+        self.worker_functions = worker_functions
+        self.continue_working = True
+        self.last_ping_epoch = 0
+        self.workerId = str(bson.ObjectId())
+        while self.continue_working:
+            work_url = self.get_url(
+                "/api/v1/projects/{projectId}/work".format(
+                    projectId=projectId
+                )
             )
-        )
-        init_post_response = self.api_call("post", init_url, json={"workerId":self.workerId})
-        if init_post_response.status_code == 204:
-            return
-        init_post_response_body = init_post_response.json()
-        job = init_post_response_body["job"]
-        stage = job["stages"][stageIndex]
-        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].drop()
-        input_namespace = "{0}.{1}".format(stage["inputDatabase"], stage["inputCollection"])
-        collections_bson = list(self.mongo_client.config.collections.find_raw_batches({"_id":input_namespace}))
+            work_request_body = {"workerId":self.workerId}
+            if queue:
+                work_request_body["queue"] = queue
+            work_get_response = self.api_call("post", work_url, json=work_request_body)
+            while work_get_response.status_code == 204:
+                if not self.continue_working:
+                    return
+                time.sleep(5)
+                work_get_response = self.api_call("post", work_url, json=work_request_body)
+            work_get_payload = work_get_response.json()
+            job = work_get_payload["job"]
+            try:
+                self._process_work(projectId, job, work_get_payload)
+            except Exception as run_error:
+                error_url = self.get_url(
+                    "/api/v1/projects/{projectId}/jobs/{jobId}/error".format(
+                        projectId=projectId, jobId=job["_id"]
+                    )
+                )
+                error_payload = {
+                    "traceback": traceback.format_exc(),
+                    "message": "\n".join(traceback.format_exception_only(run_error.__class__, run_error)),
+                    "stage": job["currentStage"]
+                }
+                self.api_call("post", error_url, json=error_payload)
+
+    def _process_work(self, projectId, job, work_get_payload):
+            if work_get_payload["action"] == "initialize":
+                self._initialize(work_get_payload, job)
+                return
+            elif work_get_payload["action"] == "cleanup":
+                self._cleanup(work_get_payload, job)
+                return
+            rangeIndex = work_get_payload["rangeIndex"]
+            range_url = self.get_url(
+                "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageName}/ranges/{rangeIndex}".format(
+                    projectId=projectId,
+                    jobId=job["_id"],
+                    stageName=job["currentStage"],
+                    rangeIndex=rangeIndex
+                )
+            )
+            resultId = str(bson.ObjectId())
+            if work_get_payload["action"] == "map":
+                self._map(work_get_payload, job, resultId)
+            elif work_get_payload["action"] == "reduce":
+                self._reduce(work_get_payload, job, resultId)
+            self.api_call("post", range_url, json={"resultId": resultId, "messageId":work_get_payload["messageId"]})
+
+    def _initialize(self, work_get_payload, job):
+        projectId = job["projectId"]
+        self.logger.info("Initializing")
+        stageName = job["currentStage"]
         init_query = None
-        if stageIndex == 0:
-            self._shard_output(stage)
+        if stageName == "map":
+            inputDatabase = job["inputDatabase"]
+            inputCollection = job["inputCollection"]
+            input_namespace = "{0}.{1}".format(inputDatabase, inputCollection)
+            if "reduceFunctionName" in job:
+                outputDatabase = job["outputDatabase"]
+                outputCollection = job["tempCollection"]
+                output_namespace = "{0}.{1}".format(outputDatabase, outputCollection)
+                self._shard_output(output_namespace)
+            collections_bson = list(self.mongo_client.config.collections.find_raw_batches({"_id": input_namespace}))
             if collections_bson[0]:
                 codec_options = bson.CodecOptions(document_class=collections.OrderedDict)
                 collection_info = bson.BSON.decode(collections_bson[0], codec_options=codec_options)
@@ -173,25 +227,37 @@ class API:
             else:
                 sort_keys = ["_id"]
                 sort = [("_id", 1)]
-        else:
+        elif stageName == "reduce":
+            ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+            if ping_response.status_code == 204:
+                return
+            inputDatabase = job["tempDatabase"]
+            inputCollection = job["tempCollection"]
+            outputDatabase = job["outputDatabase"]
+            outputCollection = job["outputCollection"]
+            output_namespace = "{0}.{1}".format(outputDatabase, outputCollection)
+            self.mongo_client[outputDatabase][outputCollection].drop()
+            self._shard_output(output_namespace)
             sort_keys = ["key"]
             sort = [("key", 1)]
-        if stageIndex == 1:
-            self._shard_output(stage)
+        else:
+            raise ValueError("Invalid stage name: " + stageName)
 
         major_version, minor_version, patch_version = pymongo.version_tuple
         if (major_version == 3 and minor_version >= 7) or major_version > 3:
-            count = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].estimated_document_count()
+            count = self.mongo_client[inputDatabase][inputCollection].estimated_document_count()
         else:
-            count = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].count()
+            count = self.mongo_client[inputDatabase][inputCollection].count()
         chunks = 100
         skip = math.ceil(count / chunks)
         objectIdKeys = set()
         notObjectIdKeys = set()
         range_docs = []
-        initialize_timeout = job["initializeTimeout"]
-        update_time = int(time.time()) + (initialize_timeout / 2)
-        collection = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]]
+        lastPing = int(time.time())
+        ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+        if ping_response.status_code == 204:
+            return
+        collection = self.mongo_client[inputDatabase][inputCollection]
         for x in range(0,chunks):
             if x < chunks:
                 return_docs = list(collection.find(filter=init_query).sort(sort).skip(skip*x).limit(1))
@@ -228,32 +294,46 @@ class API:
                     range_docs.append({"values": range_values_doc})
             else:
                 break
-            if int(time.time()) >= update_time:
-                self.api_call("patch", init_url, json={"workerId":self.workerId})
-                update_time = int(time.time()) + (initialize_timeout / 2)
+            if self._due_for_ping(lastPing, job["initializeTimeout"]):
+                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+                if ping_response.status_code == 204:
+                    return
+
+        init_url = self.get_url(
+            "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageName}/initialize".format(
+                projectId = projectId, jobId=job["_id"], stageName=stageName
+            )
+        )
         init_put_payload = {
             "ranges": range_docs,
-            "objectIdKeys":list(objectIdKeys)
+            "objectIdKeys":list(objectIdKeys),
+            "messageId": work_get_payload["messageId"]
         }
-        self.api_call("put", init_url, json=init_put_payload)
+        self.api_call("post", init_url, json=init_put_payload)
 
-    def _cleanup(self, projectId, job):
-        map_stage = job["stages"][0]
-        self.mongo_client[map_stage["outputDatabase"]][job["tempCollectionName"]].drop()
+    def _cleanup(self, work_get_payload, job):
+        projectId = job["projectId"]
+        self.mongo_client[job["tempDatabase"]][job["tempCollection"]].drop()
         if "reduceFunctionName" in job:
             range_url = self.get_url(
-                "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges".format(
-                    projectId=projectId, jobId=job["_id"], stageIndex=1
+                "/api/v1/projects/{projectId}/jobs/{jobId}/stages/reduce/ranges".format(
+                    projectId=projectId, jobId=job["_id"]
                 )
             )
-            range_response = self.api_call("get", range_url)
-            range_payload = range_response.json()
+            ranges = []
+            try:
+                range_response = self.api_call("get", range_url)
+                range_payload = range_response.json()
+                ranges = range_payload["ranges"]
+            except requests.exceptions.HTTPError as http_error:
+                if http_error.response.status_code != 404:
+                    raise http_error
+
             result_ids = []
-            for range in range_payload["ranges"]:
+            for range in ranges:
                 if "resultId" in range:
                     result_ids.append(range["resultId"])
-            reduce_stage = job["stages"][1]
-            self.mongo_client[reduce_stage["outputDatabase"]][reduce_stage["outputCollection"]].delete_many({
+            self.mongo_client[job["outputDatabase"]][job["outputCollection"]].delete_many({
                 "resultId":{"$not":{"$in":result_ids}}
             })
         cleanup_url = self.get_url(
@@ -261,86 +341,26 @@ class API:
                 projectId=projectId, jobId=job["_id"]
             )
         )
-        self.api_call("post", cleanup_url)
+        cleanup_request_body = {"messageId":work_get_payload["messageId"]}
+        self.api_call("post", cleanup_url, json=cleanup_request_body)
 
-    def run(self, projectId, worker_functions, queue=None):
-        self.worker_functions = worker_functions
-        self.continue_working = True
-        self.last_ping_epoch = 0
-        self.workerId = str(bson.ObjectId())
-        while self.continue_working:
-            work_url = self.get_url(
-                "/api/v1/projects/{projectId}/work".format(
-                    projectId=projectId
-                )
-            )
-            params = {}
-            if queue:
-                params["queue"] = queue
-            work_get_response = self.api_call("get", work_url, params=params)
-            while work_get_response.status_code == 204:
-                if not self.continue_working:
-                    return
-                time.sleep(.2)
-                work_get_response = self.api_call("get", work_url, params=params)
-            work_get_payload = work_get_response.json()
-            job = work_get_payload["job"]
-            try:
-                self._process_work(projectId, job, work_get_payload)
-            except Exception as run_error:
-                error_url = self.get_url(
-                    "/api/v1/projects/{projectId}/jobs/{jobId}/error".format(
-                        projectId=projectId, jobId=job["_id"]
-                    )
-                )
-                error_payload = {
-                    "traceback": traceback.format_exc(),
-                    "message": "\n".join(traceback.format_exception_only(run_error.__class__, run_error)),
-                    "stageIndex": job["currentStageIndex"]
-                }
-                self.api_call("post", error_url, json=error_payload)
-
-    def _process_work(self, projectId, job, work_get_payload):
-            if work_get_payload["action"] == "initialize":
-                self._initialize(projectId, job)
-                return
-            elif work_get_payload["action"] == "cleanup":
-                self._cleanup(projectId, job)
-                return
-            rangeIndex = work_get_payload["rangeIndex"]
-            range_url = self.get_url(
-                "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges/{rangeIndex}".format(
-                    projectId=projectId,
-                    jobId=job["_id"],
-                    stageIndex=job["currentStageIndex"],
-                    rangeIndex=rangeIndex
-                )
-            )
-            post_response = self.api_call("post", range_url, json={"workerId": self.workerId})
-            if post_response.status_code == 204:
-                return
-            resultId = str(bson.ObjectId())
-            if work_get_payload["action"] == "map":
-                self._map(work_get_payload, job, resultId)
-            elif work_get_payload["action"] == "reduce":
-                self._reduce(work_get_payload, job, resultId)
-            self.api_call("put", range_url, json={"resultId": resultId})
-
-    def _ping_range(self, job, rangeIndex):
-        range_url = self.get_url(
-            "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageIndex}/ranges/{rangeIndex}".format(
-                projectId=job["projectId"],
-                jobId=job["_id"],
-                stageIndex=job["currentStageIndex"],
-                rangeIndex=rangeIndex
-            )
-        )
-        update_time = self.last_ping_epoch + (job["workTimeout"] / 2)
+    def _due_for_ping(self, lastPingEpoch, timeout):
+        update_time = lastPingEpoch + (timeout / 2)
         current_time = int(time.time())
         if current_time >= update_time:
-            self.last_ping_epoch = current_time
-            patch_response = self.api_call("patch", range_url, json={"workerId": self.workerId})
-            return patch_response
+            return True
+        return False
+
+    def _ping_message(self, projectId, jobId, messageId):
+        ping_url = self.get_url(
+            "/api/v1/projects/{projectId}/jobs/{jobId}/messages/{messageId}".format(
+                projectId=projectId,
+                jobId=jobId,
+                messageId=messageId
+            )
+        )
+        ping_response = self.api_call("post", ping_url, json={"workerId": self.workerId})
+        return ping_response
 
     def _build_range_filter(self, rangeStart, rangeEnd=None, objectIdKeys=None):
         range_filter = []
@@ -369,29 +389,33 @@ class API:
                 break
         return documents
 
-    def _map(self, work_payload, job, resultId, batch_size=100):
-        rangeStart = work_payload["rangeStart"]
-        rangeEnd = work_payload.get("rangeEnd")
-        objectIdKeys = work_payload.get("objectIdKeys", [])
+    def _map(self, work_get_payload, job, resultId, batch_size=100):
+        projectId = job["projectId"]
+        rangeStart = work_get_payload["rangeStart"]
+        rangeEnd = work_get_payload.get("rangeEnd")
+        objectIdKeys = work_get_payload.get("objectIdKeys", [])
         range_filter = self._build_range_filter(rangeStart, rangeEnd=rangeEnd, objectIdKeys=objectIdKeys)
         query = job.get("filter", {})
         query.setdefault("$and", [])
         query["$and"] += range_filter
         sort = job.get("sort")
-        stage = job["stages"][0]
-        cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+        cursor = self.mongo_client[job["inputDatabase"]][job["inputCollection"]].find(
             query,
             batch_size=batch_size,
             sort=sort
         )
-        map_function_name = stage["functionName"]
+        map_function_name = job["mapFunctionName"]
         map_function = self.worker_functions[map_function_name]
         documents = self._get_batch(cursor, batch_size)
+        lastPing = int(time.time())
+        ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+        if ping_response.status_code == 204:
+            return
         while documents:
-            ping_response = self._ping_range(job, work_payload["rangeIndex"])
-            if ping_response is not None:
+            if self._due_for_ping(lastPing, job["workTimeout"]):
+                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
                 if ping_response.status_code == 204:
-                    break
+                    return
             insert_docs = []
             mapped_values = {}
             for doc in documents:
@@ -406,24 +430,21 @@ class API:
             if insert_docs:
                 for doc in insert_docs:
                     doc["resultId"] = resultId
-                try:
-                    self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_many(insert_docs)
-                except pymongo.errors.DuplicateKeyError as duplicate_key_error:
-                    pass
+                self.mongo_client[job["tempDatabase"]][job["tempCollection"]].insert_many(insert_docs)
             documents = self._get_batch(cursor, batch_size)
 
-    def _reduce(self, work_payload, job, resultId):
-        map_ranges_url = self.get_url("/api/v1/projects/{projectId}/jobs/{jobId}/stages/0/ranges".format(
+    def _reduce(self, work_get_payload, job, resultId):
+        projectId = job["projectId"]
+        map_ranges_url = self.get_url("/api/v1/projects/{projectId}/jobs/{jobId}/stages/map/ranges".format(
             projectId=job["projectId"], jobId=job["_id"]
         ))
         map_ranges_response = self.api_call("get", map_ranges_url)
         map_ranges_payload = map_ranges_response.json()
-        stage = job["stages"][1]
-        reduce_function_name = stage["functionName"]
+        reduce_function_name = job["reduceFunctionName"]
         reduce_function = self.worker_functions[reduce_function_name]
         valid_result_ids = [map_range["resultId"] for map_range in map_ranges_payload["ranges"]]
-        rangeStart = work_payload["rangeStart"]
-        rangeEnd = work_payload.get("rangeEnd")
+        rangeStart = work_get_payload["rangeStart"]
+        rangeEnd = work_get_payload.get("rangeEnd")
         range_filter = self._build_range_filter(rangeStart, rangeEnd=rangeEnd)
         finalize_function = None
         finalize_function_name = job.get("finalizeFunctionName")
@@ -433,18 +454,22 @@ class API:
             "resultId": {"$in": valid_result_ids},
             "$and": range_filter
         }
-        cursor = self.mongo_client[stage["inputDatabase"]][stage["inputCollection"]].find(
+        cursor = self.mongo_client[job["tempDatabase"]][job["tempCollection"]].find(
             query,
             sort=[("key", pymongo.ASCENDING)]
         )
         previous_key = None
         values = []
+        lastPing = int(time.time())
+        ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+        if ping_response.status_code == 204:
+            return
         doc_count = 0
         for document in cursor:
             doc_count += 1
             if doc_count >= 100:
-                ping_response = self._ping_range(job, work_payload["rangeIndex"])
-                if ping_response is not None:
+                if self._due_for_ping(lastPing, job["workTimeout"]):
+                    ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
                     if ping_response.status_code == 204:
                         return
                 doc_count = 0
@@ -457,7 +482,7 @@ class API:
                         value = values[0]
                     if finalize_function:
                         value = finalize_function(previous_key, value)
-                    self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_one(
+                    self.mongo_client[job["outputDatabase"]][job["outputCollection"]].insert_one(
                         {
                             "_id": previous_key,
                             "value":value,
@@ -476,14 +501,13 @@ class API:
             value = values[0]
         if finalize_function:
             value = finalize_function(previous_key, value)
-        self.mongo_client[stage["outputDatabase"]][stage["outputCollection"]].insert_one(
+        self.mongo_client[job["outputDatabase"]][job["outputCollection"]].insert_one(
             {
                 "_id": previous_key,
                 "value": value,
                 "resultId": resultId
             }
         )
-
 
     def stop(self):
         self.continue_working = False
@@ -520,7 +544,7 @@ class MongoMapreduceJob(collections.UserDict):
             job_response = self.api.api_call("get", job_url)
             job_payload = job_response.json()
             self.data = job_payload["job"]
-            time.sleep(.2)
+            time.sleep(5)
         if self["status"] in ["running", "cleanup"]:
             raise TimeoutError("Timed out waiting for job to complete")
         result = self.get_result()
@@ -534,9 +558,8 @@ class MongoMapreduceJob(collections.UserDict):
             raise JobNotCompleteError("Job has errors: \n" + error_info["traceback"])
         elif self["status"] != "complete":
             raise JobNotCompleteError("Job not complete.  Status: " + self["status"])
-        elif len(self["stages"]) < 2:
+        elif "reduceFunctionName" not in self:
             raise ValueError("Cannot get result for a job which does not specify a reduce function")
-        reduce_stage = self["stages"][1]
-        cursor = self.api.mongo_client[reduce_stage["outputDatabase"]][reduce_stage["outputCollection"]].find()
+        cursor = self.api.mongo_client[self["outputDatabase"]][self["outputCollection"]].find()
         for document in cursor:
             yield document["_id"], document["value"]

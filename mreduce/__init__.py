@@ -156,7 +156,7 @@ class API:
             while work_get_response.status_code == 204:
                 if not self.continue_working:
                     return
-                time.sleep(.2)
+                time.sleep(1)
                 work_get_response = self.api_call("post", work_url, json=work_request_body)
             work_get_payload = work_get_response.json()
             job = work_get_payload["job"]
@@ -544,7 +544,7 @@ class MongoMapreduceJob(collections.UserDict):
             job_response = self.api.api_call("get", job_url)
             job_payload = job_response.json()
             self.data = job_payload["job"]
-            time.sleep(.2)
+            time.sleep(1)
         if self["status"] in ["running", "cleanup"]:
             raise TimeoutError("Timed out waiting for job to complete")
         result = self.get_result()

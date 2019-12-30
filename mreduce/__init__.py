@@ -143,6 +143,9 @@ class API:
         self.continue_working = True
         self.last_ping_epoch = 0
         self.workerId = str(bson.ObjectId())
+        import cProfile
+        profile = cProfile.Profile()
+        profile.enable()
         while self.continue_working:
             work_url = self.get_url(
                 "/api/v1/projects/{projectId}/work".format(
@@ -155,6 +158,8 @@ class API:
             work_get_response = self.api_call("post", work_url, json=work_request_body)
             while work_get_response.status_code == 204:
                 if not self.continue_working:
+                    profile.disable()
+                    profile.dump_stats("stats_" + str(bson.ObjectId()))
                     return
                 time.sleep(1)
                 work_get_response = self.api_call("post", work_url, json=work_request_body)
@@ -228,9 +233,6 @@ class API:
                 sort_keys = ["_id"]
                 sort = [("_id", 1)]
         elif stageName == "reduce":
-            ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
-            if ping_response.status_code == 204:
-                return
             inputDatabase = job["tempDatabase"]
             inputCollection = job["tempCollection"]
             outputDatabase = job["outputDatabase"]
@@ -254,11 +256,13 @@ class API:
         notObjectIdKeys = set()
         range_docs = []
         lastPing = int(time.time())
-        ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
-        if ping_response.status_code == 204:
-            return
         collection = self.mongo_client[inputDatabase][inputCollection]
         for x in range(0,chunks):
+            if self._due_for_ping(lastPing, job["initializeTimeout"]):
+                lastPing = int(time.time())
+                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+                if ping_response.status_code == 204:
+                    return
             if x < chunks:
                 return_docs = list(collection.find(filter=init_query).sort(sort).skip(skip*x).limit(1))
             else:
@@ -294,10 +298,7 @@ class API:
                     range_docs.append({"values": range_values_doc})
             else:
                 break
-            if self._due_for_ping(lastPing, job["initializeTimeout"]):
-                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
-                if ping_response.status_code == 204:
-                    return
+
 
         init_url = self.get_url(
             "/api/v1/projects/{projectId}/jobs/{jobId}/stages/{stageName}/initialize".format(
@@ -408,11 +409,9 @@ class API:
         map_function = self.worker_functions[map_function_name]
         documents = self._get_batch(cursor, batch_size)
         lastPing = int(time.time())
-        ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
-        if ping_response.status_code == 204:
-            return
         while documents:
             if self._due_for_ping(lastPing, job["workTimeout"]):
+                lastPing = int(time.time())
                 ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
                 if ping_response.status_code == 204:
                     return
@@ -461,14 +460,12 @@ class API:
         previous_key = None
         values = []
         lastPing = int(time.time())
-        ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
-        if ping_response.status_code == 204:
-            return
         doc_count = 0
         for document in cursor:
             doc_count += 1
             if doc_count >= 100:
                 if self._due_for_ping(lastPing, job["workTimeout"]):
+                    lastPing = int(time.time())
                     ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
                     if ping_response.status_code == 204:
                         return

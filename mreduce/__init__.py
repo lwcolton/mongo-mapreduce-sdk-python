@@ -143,9 +143,6 @@ class API:
         self.continue_working = True
         self.last_ping_epoch = 0
         self.workerId = str(bson.ObjectId())
-        import cProfile
-        profile = cProfile.Profile()
-        profile.enable()
         while self.continue_working:
             work_url = self.get_url(
                 "/api/v1/projects/{projectId}/work".format(
@@ -158,8 +155,6 @@ class API:
             work_get_response = self.api_call("post", work_url, json=work_request_body)
             while work_get_response.status_code == 204:
                 if not self.continue_working:
-                    profile.disable()
-                    profile.dump_stats("stats_" + str(bson.ObjectId()))
                     return
                 time.sleep(1)
                 work_get_response = self.api_call("post", work_url, json=work_request_body)

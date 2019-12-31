@@ -142,14 +142,14 @@ class API:
         self.worker_functions = worker_functions
         self.continue_working = True
         self.last_ping_epoch = 0
-        self.workerId = str(bson.ObjectId())
+        workerId = str(bson.ObjectId())
         while self.continue_working:
             work_url = self.get_url(
                 "/api/v1/projects/{projectId}/work".format(
                     projectId=projectId
                 )
             )
-            work_request_body = {"workerId":self.workerId}
+            work_request_body = {"workerId":workerId}
             if queue:
                 work_request_body["queue"] = queue
             work_get_response = self.api_call("post", work_url, json=work_request_body)
@@ -161,7 +161,7 @@ class API:
             work_get_payload = work_get_response.json()
             job = work_get_payload["job"]
             try:
-                self._process_work(projectId, job, work_get_payload)
+                self._process_work(projectId, job, work_get_payload, workerId)
             except Exception as run_error:
                 error_url = self.get_url(
                     "/api/v1/projects/{projectId}/jobs/{jobId}/error".format(
@@ -175,12 +175,12 @@ class API:
                 }
                 self.api_call("post", error_url, json=error_payload)
 
-    def _process_work(self, projectId, job, work_get_payload):
+    def _process_work(self, projectId, job, work_get_payload, workerId):
             if work_get_payload["action"] == "initialize":
-                self._initialize(work_get_payload, job)
+                self._initialize(work_get_payload, job, workerId)
                 return
             elif work_get_payload["action"] == "cleanup":
-                self._cleanup(work_get_payload, job)
+                self._cleanup(work_get_payload, job, workerId)
                 return
             rangeIndex = work_get_payload["rangeIndex"]
             range_url = self.get_url(
@@ -193,12 +193,12 @@ class API:
             )
             resultId = str(bson.ObjectId())
             if work_get_payload["action"] == "map":
-                self._map(work_get_payload, job, resultId)
+                self._map(work_get_payload, job, resultId, workerId)
             elif work_get_payload["action"] == "reduce":
-                self._reduce(work_get_payload, job, resultId)
+                self._reduce(work_get_payload, job, resultId, workerId)
             self.api_call("post", range_url, json={"resultId": resultId, "messageId":work_get_payload["messageId"]})
 
-    def _initialize(self, work_get_payload, job):
+    def _initialize(self, work_get_payload, job, workerId):
         projectId = job["projectId"]
         self.logger.info("Initializing")
         stageName = job["currentStage"]
@@ -255,7 +255,7 @@ class API:
         for x in range(0,chunks):
             if self._due_for_ping(lastPing, job["initializeTimeout"]):
                 lastPing = int(time.time())
-                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"], workerId)
                 if ping_response.status_code == 204:
                     return
             if x < chunks:
@@ -307,7 +307,7 @@ class API:
         }
         self.api_call("post", init_url, json=init_put_payload)
 
-    def _cleanup(self, work_get_payload, job):
+    def _cleanup(self, work_get_payload, job, workerId):
         projectId = job["projectId"]
         self.mongo_client[job["tempDatabase"]][job["tempCollection"]].drop()
         if "reduceFunctionName" in job:
@@ -347,7 +347,7 @@ class API:
             return True
         return False
 
-    def _ping_message(self, projectId, jobId, messageId):
+    def _ping_message(self, projectId, jobId, messageId, workerId):
         ping_url = self.get_url(
             "/api/v1/projects/{projectId}/jobs/{jobId}/messages/{messageId}".format(
                 projectId=projectId,
@@ -355,7 +355,7 @@ class API:
                 messageId=messageId
             )
         )
-        ping_response = self.api_call("post", ping_url, json={"workerId": self.workerId})
+        ping_response = self.api_call("post", ping_url, json={"workerId": workerId})
         return ping_response
 
     def _build_range_filter(self, rangeStart, rangeEnd=None, objectIdKeys=None):
@@ -385,7 +385,7 @@ class API:
                 break
         return documents
 
-    def _map(self, work_get_payload, job, resultId, batch_size=100):
+    def _map(self, work_get_payload, job, resultId, workerId, batch_size=100):
         projectId = job["projectId"]
         rangeStart = work_get_payload["rangeStart"]
         rangeEnd = work_get_payload.get("rangeEnd")
@@ -407,7 +407,7 @@ class API:
         while documents:
             if self._due_for_ping(lastPing, job["workTimeout"]):
                 lastPing = int(time.time())
-                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+                ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"], workerId)
                 if ping_response.status_code == 204:
                     return
             insert_docs = []
@@ -427,7 +427,7 @@ class API:
                 self.mongo_client[job["tempDatabase"]][job["tempCollection"]].insert_many(insert_docs)
             documents = self._get_batch(cursor, batch_size)
 
-    def _reduce(self, work_get_payload, job, resultId):
+    def _reduce(self, work_get_payload, job, resultId, workerId):
         projectId = job["projectId"]
         map_ranges_url = self.get_url("/api/v1/projects/{projectId}/jobs/{jobId}/stages/map/ranges".format(
             projectId=job["projectId"], jobId=job["_id"]
@@ -461,7 +461,7 @@ class API:
             if doc_count >= 100:
                 if self._due_for_ping(lastPing, job["workTimeout"]):
                     lastPing = int(time.time())
-                    ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"])
+                    ping_response = self._ping_message(projectId, job["_id"], work_get_payload["messageId"], workerId)
                     if ping_response.status_code == 204:
                         return
                 doc_count = 0

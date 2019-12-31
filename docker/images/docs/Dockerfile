@@ -3,7 +3,7 @@ FROM httpd:2.4
 # libreadline for terminal input for debugging
 RUN apt-get update && apt-get -y install openssl libssl-dev ca-certificates python3 python3-pip
 
-RUN pip3 install sphinx
+RUN pip3 install sphinx Flask-Sphinx-Themes
 
 COPY requirements.txt /opt
 
@@ -17,7 +17,7 @@ COPY mreduce /opt/mreduce
 
 WORKDIR /opt
 
-RUN sphinx-apidoc -o docs mreduce
+RUN sphinx-apidoc -f -o docs mreduce
 
 WORKDIR /opt/docs
 

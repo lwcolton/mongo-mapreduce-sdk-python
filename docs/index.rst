@@ -6,11 +6,7 @@
 Welcome to MReduce Python SDK's documentation!
 ==============================================
 
-.. toctree::
-   :maxdepth: 2
-   :caption: Contents:
-
-   modules
+API Documentation: :py:class:`mreduce.API`
 
 Quickstart
 ==============================================

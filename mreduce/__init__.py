@@ -12,12 +12,19 @@ import requests.exceptions
 
 
 class API:
-    def __init__(self, api_key=None, mongo_client=None, host="mreduce.com", logger=None):
+    def __init__(self, api_key=None, mongo_client=None, logger=None, _host="mreduce.com"):
+        """Create an instance of the MReduce API
+
+        Args:
+            api_key (str): MReduce API Key
+            mongo_client: An instance of :py:class:`pymongo.mongo_client.MongoClient`
+            logger: An instance of :py:class:`logging.Logger`
+        """
         if type(api_key) != str:
             raise ValueError("Must supply api_key, type str")
         if not isinstance(mongo_client, pymongo.MongoClient):
             raise ValueError("Must supply mongo_client, type pymongo.MongoClient")
-        self.host = host
+        self._host = _host
         self.session = self.get_session(api_key)
         self.mongo_client = mongo_client
         self.worker_functions = None
@@ -26,17 +33,37 @@ class API:
         self.logger = logger
 
     def get_session(self, api_key, timeout=(10,10)):
+        """Get an instance of :py:class:`requests.Session` for use with the MReduce API
+
+        Args:
+            api_key (str): MReduce API Key
+            timeout (tuple): Same as the timeout argument for :py:func:`requests.request`
+        """
         session = requests.Session()
         session.timeout = timeout
         session.headers.update({'x-api-key': api_key})
         return session
 
     def get_url(self, path):
-        return "https://{0}{1}".format(self.host, path)
+        """Get a URL for the MReduce API given a requests path
+
+        Args:
+            path (str): The path of the URL
+        """
+        return "https://{0}{1}".format(self._host, path)
 
     def api_call(self, method, *args, **kwargs):
-        method_function = getattr(self.session, method.lower())
-        response = method_function(*args, **kwargs)
+        """Make a request to the MReduce api using self.session
+
+        Args:
+            method (str): Same as the method argument for :py:func:`requests.request`
+            *args: Extra arguments to pass to :py:func:`requests.request`
+            **kwargs: Extra keyword arguments to pass to :py:func:`requests.request`
+
+        Returns: py:class:`~mreduce.Job`
+        """
+        method = method.upper()
+        response = self.session.request(method, *args, **kwargs)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as http_error:
@@ -50,8 +77,22 @@ class API:
         return response
 
     def submit_job(self, projectId=None,  mapFunctionName=None, reduceFunctionName=None, finalizeFunctionName=None,
-                   inputDatabase=None, inputCollection=None, queue=None, filter=None, outputCollection=None,
-                   outputDatabase=None):
+                   inputDatabase=None, inputCollection=None, outputCollection=None,
+                   outputDatabase=None, queue=None, filter=None):
+        """Start a new job
+
+        Args:
+            projectId (str): The project ID from the MReduce dashboard
+            mapFunctionName (str): Key to the map function in worker_functions :py:func:`mreduce.API.run`
+            reduceFunctionName (str): Key to the reduce function in worker_functions :py:func:`mreduce.API.run`
+            finalizeFunctionName (str): Key to the map function in worker_functions :py:func:`mreduce.API.run`
+            inputDatabase (str): Name of the database where the inputCollection is
+            inputCollection (str): Name of the collection to use as inputs to the map function
+            outputDatabase (str): Name of the database where the outputCollection is
+            outputCollection (str): Name of the collection to store output in
+            queue (str): Submit this job to a queue.  Workers specify the queue they listen to in :py:func:`mreduce.API.run`
+            filter (dict): MongoDB filter to match input documents
+        """
         if type(projectId) != str or not projectId:
             raise ValueError("Must supply projectId argument, type string")
         if type(mapFunctionName) != str or not mapFunctionName:
@@ -82,17 +123,24 @@ class API:
             request_payload["finalizeFunctionName"] = finalizeFunctionName
         response = self.api_call("post", url, json=request_payload)
         job_data = response.json()["job"]
-        return MongoMapreduceJob(job_data, self)
+        return Job(job_data, self)
 
-    def list_jobs(self, projectId=None, filter=None, sort=None, page=None, perPage=None, timeout=(10,10)):
+    def list_jobs(self, projectId=None, filter=None, page=None, perPage=None, timeout=(10,10)):
+        """List jobs
+
+        Args:
+            projectId: Project ID from the MReduce dashboard
+            filter: MongoDB filter to filter jobs by
+            page: Page number for result pagination
+            perPage: Number of documents to return per page
+
+        Returns: list of :py:class:`~mreduce.Job` instances
+        """
         if type(projectId) != str or not projectId:
             raise ValueError("Must supply projectId type str")
         request_payload = {}
         if filter is not None:
             request_payload["filter"] = filter
-
-        if sort is not None:
-            request_payload["sort"] = sort
 
         if page is not None:
             request_payload["page"] = page
@@ -105,10 +153,18 @@ class API:
         response_payload = response.json()
         jobs = []
         for job_data in response_payload["jobs"]:
-            jobs.append(MongoMapreduceJob(job_data, self))
+            jobs.append(Job(job_data, self))
         return jobs
 
     def get_job(self, projectId, jobId):
+        """Get a single job by ID
+
+        Args:
+            projectId: Project ID from the MReduce dashboard
+            jobId: ID of the job to get
+
+        Returns: :py:class:`~mreduce.Job`
+        """
         url = self.get_url(
             "/api/v1/projects/{projectId}/jobs/{jobId}".format(
                 projectId=projectId, jobId=jobId
@@ -116,7 +172,7 @@ class API:
         )
         response = self.api_call("get", url)
         job_data = response.json()["job"]
-        return MongoMapreduceJob(job_data, self)
+        return Job(job_data, self)
 
     def _error_is_sharding_not_enabled(self, error):
         error_message = str(error)
@@ -511,12 +567,21 @@ class JobRunningError(MongoMapreduceError):
 class TimeoutError(MongoMapreduceError):
     pass
 
-class MongoMapreduceJob(collections.UserDict):
+class Job(collections.UserDict):
     def __init__(self, data, api):
-        super(MongoMapreduceJob, self).__init__(data)
+        """Represents a Job in the MReduce API
+
+        Generally you will not create instances of this class yourself
+        """
+        super(Job, self).__init__(data)
         self.api = api
 
     def wait_for_result(self, timeout=None):
+        """Wait for the job to complete
+
+        Args:
+            timeout (int): Only wait up to this many seconds
+        """
         job_url = self.api.get_url(
             "/api/v1/projects/{projectId}/jobs/{jobId}".format(
                 projectId = self["projectId"],
@@ -538,6 +603,10 @@ class MongoMapreduceJob(collections.UserDict):
         return result
 
     def get_result(self):
+        """Get the result of a job
+
+        Returns an iterable of (key, value) pairs.  Will raise an error if the job is not complete yet or has errors
+        """
         if self["status"] == "running":
             raise JobRunningError("Cannot get result until job is complete.  See wait_for_result")
         elif self["status"] == "error":

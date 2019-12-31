@@ -69,6 +69,8 @@ The following code shows how to run a map-reduce operation that will return the 
        outputCollection="test_results"
    )
    result = job.wait_for_result()
+   for key, value in result:
+       print("Key: " + key, ", Value: " + str(value))
 
 Indices and tables
 ==================

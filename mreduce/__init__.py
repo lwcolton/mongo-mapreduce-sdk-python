@@ -605,7 +605,7 @@ class Job(collections.UserDict):
     def get_result(self):
         """Get the result of a job
 
-        Returns an iterable of (key, value) pairs.  Will raise an error if the job is not complete yet or has errors
+        Returns a generator of (key, value) pairs.  Will raise an error if the job is not complete yet or has errors
         """
         if self["status"] == "running":
             raise JobRunningError("Cannot get result until job is complete.  See wait_for_result")

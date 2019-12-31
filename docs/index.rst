@@ -14,6 +14,9 @@ Welcome to MReduce Python SDK's documentation!
 
 Quickstart
 ==============================================
+
+The following code shows how to run a map-reduce operation that will return the sum of purchases for a given customer
+
 .. code-block:: python
 
    import random
@@ -52,11 +55,11 @@ Quickstart
        mongo_client = mongo_client
    )
 
-   project = api.create_project("Test Project")
+   project_id = "..."
 
    thread = threading.Thread(
        target=api.run,
-       args=[project["_id"], worker_functions]
+       args=[project_id, worker_functions]
    )
    thread.start()
 

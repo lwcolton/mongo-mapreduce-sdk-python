@@ -49,11 +49,6 @@ class API:
             raise http_error
         return response
 
-    def create_project(self, name):
-        response = self.session.post(self.get_url("/api/v1/projects"), json={"name":name})
-        response.raise_for_status()
-        return response.json()
-
     def submit_job(self, projectId=None,  mapFunctionName=None, reduceFunctionName=None, finalizeFunctionName=None,
                    inputDatabase=None, inputCollection=None, queue=None, filter=None, outputCollection=None,
                    outputDatabase=None):

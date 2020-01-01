@@ -1,6 +1,8 @@
 ---
-- shell: sleep 1
-- name: Copy docker install script
+- name: Copy repo
   copy:
     src: "{{ role_path }}/../../../"
-    dest: "/opt/mongo-mapreduce-sdk.python"
+    dest: "/opt/mongo-mapreduce-sdk-python"
+
+- name: Run docker install
+  shell: /opt/mongo-mapreduce-sdk-python/ansible/roles/docs/files/get-docker.sh

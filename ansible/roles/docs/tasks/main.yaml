@@ -5,6 +5,4 @@
     dest: "/opt/mongo-mapreduce-sdk-python"
 
 - name: Run docker install
-  shell: chdmod +x get-docker.sh && ./get-docker.sh
-  args:
-    chdir: /opt/mongo-mapreduce-sdk-python/ansible/roles/docs/files/
+  shell: chdmod +x /opt/mongo-mapreduce-sdk-python/ansible/roles/docs/files/get-docker.sh && /opt/mongo-mapreduce-sdk-python/ansible/roles/docs/files/get-docker.sh

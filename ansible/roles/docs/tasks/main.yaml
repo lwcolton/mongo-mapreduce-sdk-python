@@ -1,0 +1,6 @@
+---
+- shell: sleep 1
+#- name: Copy docker install script
+#  copy:
+#    src: "{{ role_path }}/files/get-docker.sh"
+#    dest: "/usr/local/bin/get-docker.sh"

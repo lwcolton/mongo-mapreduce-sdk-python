@@ -8,6 +8,12 @@ Welcome to MReduce Python SDK's documentation!
 
 API Documentation: :py:class:`mreduce.API`
 
+Installation
+===============================================
+.. code-block:: shell
+
+    pip install mreduce
+
 Quickstart
 ==============================================
 

@@ -22,8 +22,8 @@ git add version
 git commit -m "Release $new_version"
 git tag -a $new_version -m "Release $new_version"
 git push origin master --tags
-python setup.py register
-python setup.py sdist upload
+python3 setup.py register
+python3 setup.py sdist upload
 ansible-playbook -i ansible/prod-inventory.yaml ansible/playbook-deploy.yaml
 
 

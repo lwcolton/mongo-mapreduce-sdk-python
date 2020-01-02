@@ -8,7 +8,7 @@ with open(version_file) as version_file_handle:
 
 setup(
     name="mreduce",
-    install_requires=["falcon"],
+    install_requires=["pymongo"],
     version=version,
     author="MReduce",
     author_email="support@mreduce.com",

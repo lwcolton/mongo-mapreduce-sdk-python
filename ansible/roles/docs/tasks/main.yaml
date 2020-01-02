@@ -36,7 +36,7 @@
 - name: Copy SSL Certs
   copy:
     src: /etc/ssl/certs/docs.mreduce.com
-    dest: /etc/ssl/certs/docs.mreduce.com
+    dest: /etc/ssl/certs
 
 - name: Run docker-compose up
   shell: docker-compose -f docker/docker-compose-prod.yml up -d --build

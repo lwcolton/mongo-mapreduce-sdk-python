@@ -9,6 +9,6 @@ services:
     volumes:
      - /etc/ssl/certs/docs.mreduce.com:/usr/local/apache2/certs/docs.mreduce.com
     environment:
-      APACHE_CERT_PATH: docs.mreduce.com/fullchain.pem
-      APACHE_KEY_PATH: docs.mreduce.com/privkey.pem
+      APACHE_CERT_PATH: docs.mreduce.com/fullchain1.pem
+      APACHE_KEY_PATH: docs.mreduce.com/privkey1.pem
       DOCS_DOMAIN: docs.mreduce.com

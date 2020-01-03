@@ -1,8 +1,3 @@
-.. MReduce Python SDK documentation master file, created by
-   sphinx-quickstart on Sat Dec 14 18:47:37 2019.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
 Welcome to MReduce Python SDK's documentation!
 ==============================================
 
@@ -21,62 +16,124 @@ The following code shows how to run a map-reduce operation that will return the 
 
 .. code-block:: python
 
-   import random
-   import threading
+    import random
+    import threading
 
-   import bson
-   import pymongo
+    import bson
+    import pymongo
 
-   import mreduce
+    import mreduce
 
 
-   mongo_client = pymongo.MongoClient("mongodb://your_mongodb_server")
-   test_collection = mogno_client.test.test_collection
+    mongo_client = pymongo.MongoClient("mongodb://your_mongodb_server")
+    test_collection = mogno_client.test.test_collection
 
-   for x in range(0, 100):
-       customer_id = str(bson.ObjectId())
-       documents = []
-       for x in rangdom.randrane(10, 100):
-           price = random.randrange(0,1000)
-           documents.append({"customer_id":customer_id, "price":price})
-      test_collection.insert_many(documents)
+    for x in range(0, 100):
+        customer_id = str(bson.ObjectId())
+        documents = []
+        for x in rangdom.randrane(10, 100):
+            price = random.randrange(0,1000)
+            documents.append({"customer_id":customer_id, "price":price})
+        test_collection.insert_many(documents)
 
-   def map_func(document):
-       yield document["customer_id"], document["price"]
+    def map_func(document):
+        yield document["customer_id"], document["price"]
 
-   def reduce_func(customer_id, prices):
-       return sum(prices)
+    def reduce_func(customer_id, prices):
+        return sum(prices)
 
-   worker_functions = {
-       "exampleMap": map_func,
-       "exampleReduce": reduce_func
-   }
+    worker_functions = {
+        "exampleMap": map_func,
+        "exampleReduce": reduce_func
+    }
 
-   api = mreduce.API(
-       api_key = "...",
-       mongo_client = mongo_client
-   )
+    api = mreduce.API(
+        api_key = "...",
+        mongo_client = mongo_client
+    )
 
-   project_id = "..."
+    project_id = "..."
 
-   thread = threading.Thread(
-       target=api.run,
-       args=[project_id, worker_functions]
-   )
-   thread.start()
+    thread = threading.Thread(
+        target=api.run,
+        args=[project_id, worker_functions]
+    )
+    thread.start()
 
-   job = api.submit_job(
-       projectId=project["_id"],
-       mapFunctionName="exampleMap",
-       reduceFunctionName="exampleReduce",
-       inputDatabase="test",
-       inputCollection="test_collection",
-       outputDatabase="test",
-       outputCollection="test_results"
-   )
-   result = job.wait_for_result()
-   for key, value in result:
-       print("Key: " + key, ", Value: " + str(value))
+    job = api.submit_job(
+        projectId=project["_id"],
+        mapFunctionName="exampleMap",
+        reduceFunctionName="exampleReduce",
+        inputDatabase="test",
+        inputCollection="test_collection",
+        outputDatabase="test",
+        outputCollection="test_results"
+    )
+    result = job.wait_for_result()
+    for key, value in result:
+        print("Key: " + key, ", Value: " + str(value))
+
+Note
+===========================
+MReduce guarantees at-least-once delivery.  That is in the event of server failure your function may be called multiple times with
+the same input document(s).
+
+Running a maintenance task
+============================
+
+MReduce can be used to run maintenance tasks, in addition to map reduce jobs.  To run a maintenance task simply omit
+the 'reduceFunction', 'finalizeFunction', 'outputDatabase', and 'outputCollection' parameters.
+
+.. code-block:: python
+
+    import random
+    import threading
+
+    import bson
+    import pymongo
+
+    import mreduce
+
+
+    mongo_client = pymongo.MongoClient("mongodb://your_mongodb_server")
+    test_collection = mogno_client.test.test_collection
+
+    for x in range(0, 100):
+        customer_id = str(bson.ObjectId())
+        documents = []
+        for x in rangdom.randrane(10, 100):
+            price = random.randrange(0,1000)
+            documents.append({"customer_id":customer_id, "price":price})
+        test_collection.insert_many(documents)
+
+    def billCustomer(document):
+        # Bill customer for document["price"]
+        pass
+
+
+    worker_functions = {
+        "billCustomer": billCustomer
+    }
+
+    api = mreduce.API(
+        api_key = "...",
+        mongo_client = mongo_client
+    )
+
+    project_id = "..."
+
+    thread = threading.Thread(
+        target=api.run,
+        args=[project_id, worker_functions]
+    )
+    thread.start()
+
+    job = api.submit_job(
+        projectId=project["_id"],
+        mapFunctionName="billCustomer",
+        inputDatabase="test",
+        inputCollection="test_collection",
+    )
 
 Indices and tables
 ==================

@@ -20,6 +20,7 @@
 - name: Check for docker
   shell: docker ps -a
   register: docker_rc
+  ignore_errors: yes
 
 - name: Run docker install
   shell: chmod +x get-docker.sh && ./get-docker.sh

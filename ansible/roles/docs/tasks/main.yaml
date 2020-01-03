@@ -10,7 +10,7 @@
     chdir: /opt/mongo-mapreduce-sdk-python
 
 - name: Copy repo
-  local_action: shell git push ssh://root@{{ inventory_hostname}}:/opt/mongo-mapreduce-sdk-python master
+  local_action: shell git push ssh://root@{{ inventory_hostname }}:/opt/mongo-mapreduce-sdk-python master
 
 - name: Checkout master branch
   shell: git checkout master

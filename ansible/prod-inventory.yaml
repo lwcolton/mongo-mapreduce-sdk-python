@@ -2,6 +2,6 @@ all:
   children:
     docs:
       hosts:
-        "159.65.68.233":
+        "10.138.129.216":
       vars:
         ansible_user: root

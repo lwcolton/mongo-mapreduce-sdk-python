@@ -11,6 +11,21 @@ import requests
 import requests.exceptions
 
 
+class MongoMapreduceError(Exception):
+    pass
+
+class JobNotCompleteError(MongoMapreduceError):
+    pass
+
+class JobRunningError(MongoMapreduceError):
+    pass
+
+class TimeoutError(MongoMapreduceError):
+    pass
+
+class MaximumJobsError(MongoMapreduceError):
+    pass
+
 class API:
     def __init__(self, api_key=None, mongo_client=None, logger=None, _host="mreduce.com"):
         """Create an instance of the MReduce API
@@ -121,7 +136,13 @@ class API:
             request_payload["reduceFunctionName"] = reduceFunctionName
         if finalizeFunctionName:
             request_payload["finalizeFunctionName"] = finalizeFunctionName
-        response = self.api_call("post", url, json=request_payload)
+        try:
+            response = self.api_call("post", url, json=request_payload)
+        except requests.HTTPError as http_error:
+            if http_error.response.status_code == 429:
+                raise MaximumJobsError("You have reached the projects limit of jobs for this month")
+            else:
+                raise http_error
         job_data = response.json()["job"]
         return Job(job_data, self)
 
@@ -554,18 +575,6 @@ class API:
 
     def stop(self):
         self.continue_working = False
-
-class MongoMapreduceError(Exception):
-    pass
-
-class JobNotCompleteError(MongoMapreduceError):
-    pass
-
-class JobRunningError(MongoMapreduceError):
-    pass
-
-class TimeoutError(MongoMapreduceError):
-    pass
 
 class Job(collections.UserDict):
     def __init__(self, data, api):
